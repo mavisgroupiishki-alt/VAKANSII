@@ -1,10 +1,12 @@
 """Mavis HR Bot — точка входа."""
 import asyncio
 import logging
+import os
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiohttp import web
 
 from config import BOT_TOKEN
 from db.database import init_db
@@ -39,10 +41,22 @@ async def main() -> None:
     # Запускаем планировщик напоминаний
     setup_scheduler(bot)
 
+    # HTTP-сервер для health-check (нужен бесплатному тарифу Render)
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="Mavis HR Bot is running"))
+    app.router.add_get("/health", lambda r: web.Response(text="OK"))
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "10000"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"HTTP health-check на порту {port}")
+
     log.info("Бот запущен и готов к работе")
     try:
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
+        await runner.cleanup()
         await bot.session.close()
 
 
