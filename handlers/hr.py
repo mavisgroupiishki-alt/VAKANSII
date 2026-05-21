@@ -1,6 +1,8 @@
 """Хендлеры для рекрутера — админ-команды."""
 import csv
 import io
+import secrets
+import os
 from datetime import datetime
 
 from aiogram import Router, Bot
@@ -22,10 +24,14 @@ router = Router()
 # FSM ДЛЯ ДОБАВЛЕНИЯ КАНДИДАТА
 # ============================================================
 class AddCandidate(StatesGroup):
-    waiting_tg_id = State()
     waiting_full_name = State()
-    waiting_username = State()
     waiting_phone = State()
+    waiting_username = State()
+
+
+def _gen_invite_code() -> str:
+    """Генерирует уникальный короткий код приглашения."""
+    return secrets.token_urlsafe(8).replace("-", "a").replace("_", "b")[:10]
 
 
 # ============================================================
@@ -37,10 +43,11 @@ async def cmd_help(message: Message):
         return
     text = (
         "<b>🛠 Команды рекрутера</b>\n\n"
-        "/add — добавить нового кандидата\n"
+        "/add — добавить кандидата (выдаст ссылку-приглашение)\n"
         "/list — список всех кандидатов\n"
         "/active — только активные\n"
         "/candidate ID — карточка кандидата\n"
+        "/invite ID — показать ссылку-приглашение ещё раз\n"
         "/cases ID — кейсы для собеседования\n"
         "/set_status ID статус — изменить статус\n"
         "  Статусы: active, passed, failed, on_pause, no_response, offer_sent, rejected\n"
@@ -64,12 +71,11 @@ async def cmd_myid(message: Message):
 async def add_start(message: Message, state: FSMContext):
     if not is_hr(message.from_user.id):
         return
-    await state.set_state(AddCandidate.waiting_tg_id)
+    await state.set_state(AddCandidate.waiting_full_name)
     await message.answer(
-        "Добавление кандидата.\n\n"
-        "Введите его Telegram ID (число). Кандидат должен сначала написать боту /start, "
-        "чтобы вы могли узнать его ID — попросите его прислать ID через @userinfobot.\n\n"
-        "Или /cancel для отмены."
+        "<b>➕ Добавление кандидата</b>\n\n"
+        "Введите <b>ФИО кандидата</b>:\n\n"
+        "(или /cancel для отмены)"
     )
 
 
@@ -81,84 +87,126 @@ async def cancel(message: Message, state: FSMContext):
     await message.answer("Отменено.")
 
 
-@router.message(AddCandidate.waiting_tg_id)
-async def add_tg_id(message: Message, state: FSMContext):
-    try:
-        tg_id = int(message.text.strip())
-    except ValueError:
-        await message.answer("Нужно число. Введите Telegram ID кандидата.")
-        return
-
-    # Проверяем, нет ли уже такого кандидата
-    async with get_session() as s:
-        result = await s.execute(select(Candidate).where(Candidate.telegram_id == tg_id))
-        existing = result.scalar_one_or_none()
-        if existing:
-            await message.answer(f"⚠️ Кандидат с этим ID уже есть: <b>{existing.full_name}</b>")
-            await state.clear()
-            return
-
-    await state.update_data(tg_id=tg_id)
-    await state.set_state(AddCandidate.waiting_full_name)
-    await message.answer("ФИО кандидата:")
-
-
 @router.message(AddCandidate.waiting_full_name)
 async def add_full_name(message: Message, state: FSMContext):
-    await state.update_data(full_name=message.text.strip())
-    await state.set_state(AddCandidate.waiting_username)
-    await message.answer("Username в Telegram (@username) или '-' если нет:")
-
-
-@router.message(AddCandidate.waiting_username)
-async def add_username(message: Message, state: FSMContext):
-    username = message.text.strip().lstrip("@")
-    if username == "-":
-        username = None
-    await state.update_data(username=username)
+    full_name = message.text.strip()
+    if len(full_name) < 3:
+        await message.answer("ФИО слишком короткое. Введите снова.")
+        return
+    await state.update_data(full_name=full_name)
     await state.set_state(AddCandidate.waiting_phone)
-    await message.answer("Телефон кандидата (или '-' если нет):")
+    await message.answer("📱 Введите <b>номер телефона</b> кандидата (или '-' если нет):")
 
 
 @router.message(AddCandidate.waiting_phone)
-async def add_phone(message: Message, state: FSMContext, bot: Bot):
+async def add_phone(message: Message, state: FSMContext):
     phone = message.text.strip()
     if phone == "-":
         phone = None
+    await state.update_data(phone=phone)
+    await state.set_state(AddCandidate.waiting_username)
+    await message.answer(
+        "💬 Введите <b>username в Telegram</b> (@username) или '-' если не знаете.\n\n"
+        "<i>Это нужно только для вашего удобства — для связи. На работу бота не влияет.</i>"
+    )
+
+
+@router.message(AddCandidate.waiting_username)
+async def add_username(message: Message, state: FSMContext, bot: Bot):
+    username = message.text.strip().lstrip("@")
+    if username == "-":
+        username = None
     data = await state.get_data()
 
+    # Генерируем уникальный код приглашения
+    invite_code = _gen_invite_code()
+
     async with get_session() as s:
+        # Защита от коллизий — крайне маловероятно, но мало ли
+        for _ in range(5):
+            check = await s.execute(select(Candidate).where(Candidate.invite_code == invite_code))
+            if check.scalar_one_or_none() is None:
+                break
+            invite_code = _gen_invite_code()
+
         candidate = Candidate(
-            telegram_id=data["tg_id"],
+            telegram_id=None,  # Заполнится когда кандидат кликнет ссылку
             full_name=data["full_name"],
-            username=data.get("username"),
-            phone=phone,
+            username=username,
+            phone=data.get("phone"),
+            invite_code=invite_code,
             stage=0,
             status="active",
             added_by=message.from_user.id,
-            awaiting="start_button",
+            awaiting="invite_pending",
         )
         s.add(candidate)
+        await s.flush()
+        cid = candidate.id
 
     await state.clear()
+
+    # Получаем username бота для формирования ссылки
+    bot_info = await bot.get_me()
+    invite_link = f"https://t.me/{bot_info.username}?start={invite_code}"
+
     await message.answer(
-        HR_NEW_CANDIDATE_ADDED.format(name=data["full_name"], tg_id=data["tg_id"]),
+        f"✅ Кандидат <b>{data['full_name']}</b> добавлен (#{cid}).\n\n"
+        f"<b>📨 Ссылка-приглашение:</b>\n"
+        f"<code>{invite_link}</code>\n\n"
+        f"<b>Отправьте эту ссылку кандидату</b> любым удобным способом:\n"
+        f"• Telegram (если знаете username)\n"
+        f"• WhatsApp / Viber\n"
+        f"• SMS на номер {data.get('phone') or '—'}\n"
+        f"• E-mail\n\n"
+        f"Когда кандидат кликнет ссылку — бот сразу начнёт собеседование и пришлёт вам уведомление."
     )
 
-    # Пытаемся сразу написать кандидату
+
+# ============================================================
+# /invite ID — повторно показать ссылку
+# ============================================================
+@router.message(Command("invite"))
+async def cmd_invite(message: Message, bot: Bot):
+    if not is_hr(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /invite &lt;ID&gt;")
+        return
     try:
-        await bot.send_message(
-            data["tg_id"],
-            f"👋 Здравствуйте, {data['full_name'].split()[0]}!\n\n"
-            "Вас добавили в систему собеседования Mavis Group.\n"
-            "Нажмите /start, чтобы начать."
-        )
-        await message.answer("✅ Кандидату отправлено стартовое сообщение.")
-    except Exception as e:
-        await message.answer(
-            f"⚠️ Не удалось написать кандидату напрямую (возможно, он ещё не начинал диалог с ботом).\n\n"
-            f"Попросите его открыть бота и нажать /start.\n\n<code>{e}</code>",
-        )
+        cid = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    async with get_session() as s:
+        result = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = result.scalar_one_or_none()
+        if not c:
+            await message.answer("Кандидат не найден.")
+            return
+        if not c.invite_code:
+            await message.answer("У этого кандидата нет ссылки-приглашения (старая запись).")
+            return
+        full_name = c.full_name
+        invite_code = c.invite_code
+        already_activated = c.telegram_id is not None
+
+    bot_info = await bot.get_me()
+    invite_link = f"https://t.me/{bot_info.username}?start={invite_code}"
+
+    status_text = (
+        "ℹ️ Кандидат уже активировал приглашение и проходит воронку."
+        if already_activated
+        else "⏳ Кандидат ещё не активировал приглашение."
+    )
+
+    await message.answer(
+        f"<b>📨 Ссылка для {full_name} (#{cid})</b>\n\n"
+        f"<code>{invite_link}</code>\n\n"
+        f"{status_text}"
+    )
 
 
 # ============================================================

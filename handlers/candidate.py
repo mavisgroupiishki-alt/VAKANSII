@@ -111,12 +111,62 @@ async def notify_hr(bot: Bot, text: str) -> None:
 # ============================================================
 @router.message(CommandStart())
 async def cmd_start(message: Message, bot: Bot):
+    # Извлекаем параметр после /start (deep link, например /start inv_abc123)
+    parts = message.text.split(maxsplit=1)
+    payload = parts[1].strip() if len(parts) > 1 else ""
+
+    # Сначала проверяем, нет ли активной записи у этого пользователя
     candidate = await get_candidate(message.from_user.id)
+
+    # Если есть deep-link payload и пользователь ещё не кандидат —
+    # пробуем привязать его к приглашению
+    if payload and not candidate:
+        async with get_session() as s:
+            result = await s.execute(
+                select(Candidate).where(Candidate.invite_code == payload)
+            )
+            invited = result.scalar_one_or_none()
+
+            if invited is None:
+                await message.answer(
+                    "👋 Здравствуйте! Этот бот доступен только для приглашённых кандидатов.\n\n"
+                    "Ссылка-приглашение неверна или истекла. "
+                    "Если вы ожидаете собеседования в Mavis Group — свяжитесь с рекрутером."
+                )
+                return
+
+            if invited.telegram_id is not None:
+                # Кто-то уже активировал это приглашение
+                await message.answer(
+                    "⚠️ Эта ссылка-приглашение уже была использована другим пользователем.\n\n"
+                    "Если это ошибка — свяжитесь с рекрутером."
+                )
+                return
+
+            # Привязываем Telegram-аккаунт к записи кандидата
+            invited.telegram_id = message.from_user.id
+            # Если HR не указал username, подтянем из Telegram
+            if not invited.username and message.from_user.username:
+                invited.username = message.from_user.username
+            invited.last_activity_at = datetime.utcnow()
+            invited.awaiting = "start_button"
+            candidate_id_local = invited.id
+            full_name_local = invited.full_name
+
+        # Перечитаем кандидата свежим запросом
+        candidate = await get_candidate(message.from_user.id)
+        # Уведомляем HR об активации
+        await notify_hr(
+            bot,
+            f"✅ Кандидат <b>{full_name_local}</b> (#{candidate_id_local}) активировал приглашение и начал собеседование."
+        )
+
     if not candidate:
+        # Нет ни payload, ни существующей записи — это не приглашённый
         await message.answer(
             "👋 Здравствуйте! Этот бот доступен только для приглашённых кандидатов.\n\n"
             "Если вы ожидаете собеседования в Mavis Group — свяжитесь с рекрутером, "
-            "чтобы вас добавили в систему."
+            "чтобы получить ссылку-приглашение."
         )
         return
 
