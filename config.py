@@ -14,7 +14,9 @@ def _parse_ids(raw: str) -> list[int]:
 BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
 HR_TELEGRAM_IDS: list[int] = _parse_ids(os.getenv("HR_TELEGRAM_IDS", ""))
 
-PASS_THRESHOLD: int = int(os.getenv("PASS_THRESHOLD", "85"))
+PASS_THRESHOLD: int = int(os.getenv("PASS_THRESHOLD", "85"))  # для совместимости со старым кодом
+PASS_THRESHOLD_TEST_1: int = int(os.getenv("PASS_THRESHOLD_TEST_1", "85"))
+PASS_THRESHOLD_TEST_2: int = int(os.getenv("PASS_THRESHOLD_TEST_2", "75"))
 REMINDER_INTERVAL_HOURS: int = int(os.getenv("REMINDER_INTERVAL_HOURS", "1"))
 MAX_REMINDERS: int = int(os.getenv("MAX_REMINDERS", "3"))
 
