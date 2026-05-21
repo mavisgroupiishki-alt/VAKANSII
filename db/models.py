@@ -12,10 +12,13 @@ class Candidate(Base):
     __tablename__ = "candidates"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    # telegram_id заполняется когда кандидат кликает по ссылке-приглашению
+    telegram_id: Mapped[int | None] = mapped_column(BigInteger, unique=True, index=True, nullable=True)
     username: Mapped[str | None] = mapped_column(String(64), nullable=True)
     full_name: Mapped[str] = mapped_column(String(255))
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Уникальный код для ссылки-приглашения (t.me/bot?start=inv_XXX)
+    invite_code: Mapped[str | None] = mapped_column(String(32), unique=True, index=True, nullable=True)
 
     # Воронка:
     # 0 = добавлен, не стартовал
