@@ -11,7 +11,7 @@ from aiogram.types import (
 from sqlalchemy import select
 
 from config import (
-    HR_TELEGRAM_IDS, PASS_THRESHOLD,
+    HR_TELEGRAM_IDS, PASS_THRESHOLD_TEST_1, PASS_THRESHOLD_TEST_2,
     TEST1_TIME_LIMIT_HOURS, TEST2_TIME_LIMIT_HOURS,
 )
 from db.database import get_session
@@ -25,7 +25,7 @@ from data.texts import (
     HR_STARTED, HR_TEST_PASSED, HR_TEST_FAILED, HR_INTERVIEW_PASSED,
     HR_MOTIVATION_ANSWER,
 )
-from data.videos import VIDEO_1_PATH, VIDEO_2_URL, MATERIALS_URL
+from data.videos import VIDEO_1_PATH, VIDEO_2_PATH, MATERIALS_URL
 
 router = Router()
 
@@ -58,16 +58,31 @@ def kb_watched_video_2() -> InlineKeyboardMarkup:
 
 
 def kb_question(test_num: int, q_idx: int, question: dict, selected: list[int]) -> InlineKeyboardMarkup:
-    """Клавиатура для вопроса теста."""
+    """Клавиатура для вопроса теста.
+
+    Если вариант ответа длинный — на кнопке показываем номер + начало,
+    а сам полный текст идёт в сообщении с вопросом (см. send_question).
+    """
     rows = []
-    for i, opt in enumerate(question["options"]):
+    options = question["options"]
+    # Считаем максимальную длину опции — если все короткие, выводим как есть
+    use_numbers = any(len(opt) > 50 for opt in options)
+
+    for i, opt in enumerate(options):
         # Для multi-select показываем галочки на выбранных
         if question["type"] == "multi":
             prefix = "✅ " if i in selected else "⬜ "
         else:
             prefix = ""
+
+        if use_numbers:
+            # Длинные варианты — на кнопке только номер
+            btn_text = f"{prefix}{i + 1}"
+        else:
+            btn_text = f"{prefix}{opt}"
+
         rows.append([InlineKeyboardButton(
-            text=f"{prefix}{opt[:60]}",
+            text=btn_text,
             callback_data=f"ans_{test_num}_{q_idx}_{i}"
         )])
     # Для multi нужна кнопка "Подтвердить"
@@ -311,12 +326,26 @@ async def send_question(message: Message, candidate_id: int, test_num: int, q_id
         return
 
     question = questions[q_idx]
+    options = question["options"]
+    use_numbers = any(len(opt) > 50 for opt in options)
+
     text = (
         f"<b>Вопрос {q_idx + 1} из {len(questions)}</b>\n\n"
         f"{question['text']}"
     )
+
+    # Если опции длинные — выводим их нумерованным списком в тексте
+    if use_numbers:
+        text += "\n\n<b>Варианты ответа:</b>"
+        for i, opt in enumerate(options):
+            text += f"\n<b>{i + 1}.</b> {opt}"
+        text += "\n\n<i>Нажмите кнопку с номером ответа ниже 👇</i>"
+
     if question["type"] == "multi":
-        text += "\n\n<i>Выберите все подходящие варианты и нажмите «Подтвердить выбор».</i>"
+        if use_numbers:
+            text += "\n<i>Можно выбрать несколько. После выбора нажмите «Подтвердить выбор».</i>"
+        else:
+            text += "\n\n<i>Выберите все подходящие варианты и нажмите «Подтвердить выбор».</i>"
 
     await message.answer(
         text,
@@ -474,7 +503,8 @@ async def finish_test(message: Message, candidate_id: int, test_num: int):
                 correct_count += 1
 
         score = round(correct_count / len(questions) * 100, 1)
-        passed = score >= PASS_THRESHOLD
+        threshold = PASS_THRESHOLD_TEST_1 if test_num == 1 else PASS_THRESHOLD_TEST_2
+        passed = score >= threshold
 
         session.is_active = False
 
@@ -566,12 +596,21 @@ async def handle_motivation(message: Message, bot: Bot):
     # Запускаем этап 2
     await message.answer(
         STAGE_2_INTRO.format(materials_url=MATERIALS_URL),
-        reply_markup=kb_watched_video_2(),
         disable_web_page_preview=False,
     )
-    # Видео-2 (если есть ссылка)
-    if VIDEO_2_URL:
-        await message.answer(f"📹 Видео о продуктах: {VIDEO_2_URL}")
+    # Видео 2 — отправляем файлом
+    video_2 = Path(VIDEO_2_PATH)
+    if video_2.exists():
+        await message.answer_video(
+            video=FSInputFile(video_2),
+            caption="📹 Видео о продуктах Mavis Group",
+            reply_markup=kb_watched_video_2(),
+        )
+    else:
+        await message.answer(
+            "⚠️ Видео временно недоступно. Уведомите рекрутера.",
+            reply_markup=kb_watched_video_2(),
+        )
 
 
 # ============================================================
