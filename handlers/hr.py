@@ -49,6 +49,7 @@ async def cmd_help(message: Message):
         "/candidate ID — карточка кандидата\n"
         "/invite ID — показать ссылку-приглашение ещё раз\n"
         "/cases ID — кейсы для собеседования\n"
+        "/slots — расписание собеседований (кто на какое время записался)\n"
         "/set_status ID статус — изменить статус\n"
         "  Статусы: active, passed, failed, on_pause, no_response, offer_sent, rejected\n"
         "/notify ID текст — отправить сообщение кандидату\n"
@@ -317,6 +318,10 @@ async def cmd_candidate(message: Message):
     if c.motivation_answer:
         text += f"\n<b>💬 Мотивационный ответ:</b>\n<i>{c.motivation_answer[:500]}</i>"
 
+    if c.interview_slot:
+        from data.slots import slot_label
+        text += f"\n\n<b>📅 Слот собеседования:</b> {slot_label(c.interview_slot)}"
+
     await message.answer(text)
 
 
@@ -509,6 +514,8 @@ async def cmd_export(message: Message):
     for r in all_tr:
         tr_by_cid.setdefault(r.candidate_id, {})[r.test_number] = r.score_percent
 
+    from data.slots import slot_label as _slot_label
+
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow([
@@ -516,6 +523,7 @@ async def cmd_export(message: Message):
         "Этап", "Статус",
         "Тест 1 %", "Тест 2 %",
         "Мотивация",
+        "Слот собеседования",
         "Добавлен", "Последняя активность"
     ])
     for c in candidates:
@@ -525,6 +533,7 @@ async def cmd_export(message: Message):
             c.stage, c.status,
             scores.get(1, ""), scores.get(2, ""),
             (c.motivation_answer or "").replace("\n", " ")[:300],
+            _slot_label(c.interview_slot) if c.interview_slot else "",
             c.added_at.strftime("%Y-%m-%d %H:%M"),
             c.last_activity_at.strftime("%Y-%m-%d %H:%M"),
         ])
@@ -535,3 +544,58 @@ async def cmd_export(message: Message):
         BufferedInputFile(csv_bytes, filename=filename),
         caption=f"📊 Выгрузка кандидатов: {len(candidates)} шт."
     )
+
+
+# ============================================================
+# /slots — расписание группового собеседования
+# ============================================================
+@router.message(Command("slots"))
+async def cmd_slots(message: Message):
+    """Показывает, кто на какой слот записался + список «не подходит»."""
+    if not is_hr(message.from_user.id):
+        return
+
+    from data.slots import INTERVIEW_SLOTS
+
+    async with get_session() as s:
+        result = await s.execute(
+            select(Candidate).where(Candidate.interview_slot.is_not(None))
+        )
+        candidates = result.scalars().all()
+
+    # Группируем по слотам
+    by_slot: dict[str, list[Candidate]] = {}
+    for c in candidates:
+        by_slot.setdefault(c.interview_slot, []).append(c)
+
+    text = "<b>📅 Расписание собеседований</b>\n\n"
+
+    # Сначала фиксированные слоты по порядку
+    for key, slot in INTERVIEW_SLOTS.items():
+        people = by_slot.get(key, [])
+        text += f"<b>{slot['label']}</b> — {len(people)} чел.\n"
+        for c in people:
+            text += f"  • #{c.id} {c.full_name}"
+            if c.username:
+                text += f" (@{c.username})"
+            if c.phone:
+                text += f" — {c.phone}"
+            text += "\n"
+        text += "\n"
+
+    # Потом — те, кому не подошло время
+    no_match = by_slot.get("no_match", [])
+    if no_match:
+        text += f"<b>⚠️ Требуют индивидуального подбора времени</b> — {len(no_match)} чел.\n"
+        for c in no_match:
+            text += f"  • #{c.id} {c.full_name}"
+            if c.username:
+                text += f" (@{c.username})"
+            if c.phone:
+                text += f" — <b>{c.phone}</b>"
+            text += "\n"
+
+    if not candidates:
+        text += "<i>Никто ещё не выбрал время.</i>"
+
+    await message.answer(text)

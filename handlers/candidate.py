@@ -17,13 +17,15 @@ from config import (
 from db.database import get_session
 from db.models import Candidate, TestResult, TestSession
 from data.questions import get_questions
+from data.slots import INTERVIEW_SLOTS, slot_label
 from data.texts import (
     WELCOME, STAGE_1_INTRO, STAGE_2_INTRO,
     TEST_1_START, TEST_2_START,
     TEST_PASSED, TEST_FAILED, INTERVIEW_PASSED,
     MOTIVATION_QUESTION, MOTIVATION_RECEIVED,
+    SLOT_CHOSEN, SLOT_NO_MATCH,
     HR_STARTED, HR_TEST_PASSED, HR_TEST_FAILED, HR_INTERVIEW_PASSED,
-    HR_MOTIVATION_ANSWER,
+    HR_MOTIVATION_ANSWER, HR_SLOT_CHOSEN, HR_SLOT_NO_MATCH,
 )
 from data.videos import VIDEO_1_PATH, VIDEO_2_PATH, MATERIALS_URL
 
@@ -55,6 +57,21 @@ def kb_watched_video_2() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Я изучил, готов к тесту", callback_data="ready_test_2")
     ]])
+
+
+def kb_interview_slots() -> InlineKeyboardMarkup:
+    """Кнопки с доступными слотами + кнопка «Время не подходит»."""
+    rows = []
+    for key, slot in INTERVIEW_SLOTS.items():
+        rows.append([InlineKeyboardButton(
+            text=f"📅 {slot['label']}",
+            callback_data=f"slot_{key}",
+        )])
+    rows.append([InlineKeyboardButton(
+        text="❌ Время не подходит",
+        callback_data="slot_no_match",
+    )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_question(test_num: int, q_idx: int, question: dict, selected: list[int]) -> InlineKeyboardMarkup:
@@ -557,11 +574,18 @@ async def finish_test(message: Message, candidate_id: int, test_num: int):
         # Спрашиваем мотивационный вопрос
         await message.answer(MOTIVATION_QUESTION)
     elif passed and test_num == 2:
-        # Финал воронки
-        await message.answer(INTERVIEW_PASSED)
+        # Финал тестовой части — предлагаем выбрать время собеседования
+        await message.answer(
+            INTERVIEW_PASSED,
+            reply_markup=kb_interview_slots(),
+        )
         await notify_hr(bot, HR_INTERVIEW_PASSED.format(
             name=full_name, candidate_id=candidate_id
         ))
+        # Обновляем awaiting, чтобы напоминания при необходимости работали
+        async with get_session() as s:
+            cand = (await s.execute(select(Candidate).where(Candidate.id == candidate_id))).scalar_one()
+            cand.awaiting = "slot_pick"
 
 
 # ============================================================
@@ -629,4 +653,73 @@ async def ready_test_2(callback: CallbackQuery):
         reply_markup=kb_start_test(2),
     )
     await update_activity(candidate.id, awaiting="test_2_start")
+    await callback.answer()
+
+
+# ============================================================
+# ВЫБОР СЛОТА СОБЕСЕДОВАНИЯ
+# ============================================================
+@router.callback_query(F.data.startswith("slot_"))
+async def handle_slot_choice(callback: CallbackQuery, bot: Bot):
+    """Обработка выбора слота или нажатия «Время не подходит»."""
+    candidate = await get_candidate(callback.from_user.id)
+    if not candidate:
+        await callback.answer("Кандидат не найден", show_alert=True)
+        return
+
+    # Если кандидат уже выбрал — не даём выбрать второй раз
+    if candidate.interview_slot:
+        await callback.answer("Вы уже сделали выбор. Если нужно изменить — напишите рекрутеру.", show_alert=True)
+        return
+
+    payload = callback.data[len("slot_"):]  # "mon_12", "wed_09", "fri_15" или "no_match"
+
+    is_no_match = payload == "no_match"
+
+    # Валидация — слот должен существовать в списке (или это no_match)
+    if not is_no_match and payload not in INTERVIEW_SLOTS:
+        await callback.answer("Этот слот недоступен.", show_alert=True)
+        return
+
+    # Сохраняем выбор
+    async with get_session() as s:
+        result = await s.execute(select(Candidate).where(Candidate.id == candidate.id))
+        c = result.scalar_one()
+        c.interview_slot = payload
+        c.stage = 5  # на этапе кейсов
+        c.awaiting = None  # больше ничего не ждём от кандидата
+        c.last_activity_at = datetime.utcnow()
+        c.reminder_count = 0
+        full_name = c.full_name
+        phone = c.phone or "—"
+        username = c.username or "—"
+        candidate_id = c.id
+
+    # Убираем клавиатуру
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if is_no_match:
+        # Кандидат не может в предложенное время
+        await callback.message.answer(SLOT_NO_MATCH.format(phone=phone))
+        await notify_hr(bot, HR_SLOT_NO_MATCH.format(
+            name=full_name,
+            candidate_id=candidate_id,
+            username=username,
+            phone=phone,
+        ))
+    else:
+        # Кандидат выбрал слот
+        label = slot_label(payload)
+        await callback.message.answer(SLOT_CHOSEN.format(slot_label=label))
+        await notify_hr(bot, HR_SLOT_CHOSEN.format(
+            name=full_name,
+            candidate_id=candidate_id,
+            slot_label=label,
+            username=username,
+            phone=phone,
+        ))
+
     await callback.answer()
