@@ -26,6 +26,11 @@ async def _run_migrations(conn) -> None:
         await conn.execute(text("ALTER TABLE candidates ADD COLUMN invite_code VARCHAR(32)"))
         await conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS ix_candidates_invite_code ON candidates(invite_code)"))
 
+    # Добавляем interview_slot, если ещё нет
+    if "interview_slot" not in columns:
+        log.info("Миграция: добавляю поле interview_slot в таблицу candidates")
+        await conn.execute(text("ALTER TABLE candidates ADD COLUMN interview_slot VARCHAR(64)"))
+
 
 async def init_db() -> None:
     """Создать таблицы при первом запуске + миграции."""

@@ -45,6 +45,10 @@ class Candidate(Base):
     # Мотивационный ответ
     motivation_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # Выбранный слот собеседования (ключ из INTERVIEW_SLOTS в data/slots.py)
+    # или "no_match" если кандидат нажал «Время не подходит»
+    interview_slot: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
     test_results: Mapped[list["TestResult"]] = relationship(
         back_populates="candidate", cascade="all, delete-orphan"
     )
