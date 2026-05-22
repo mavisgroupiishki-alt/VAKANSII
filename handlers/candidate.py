@@ -24,6 +24,7 @@ from data.texts import (
     TEST_PASSED, TEST_FAILED, INTERVIEW_PASSED,
     MOTIVATION_QUESTION, MOTIVATION_RECEIVED,
     SLOT_CHOSEN, SLOT_NO_MATCH,
+    REVIEW_INTRO_ALL_CORRECT, REVIEW_INTRO_WITH_ERRORS, REVIEW_QUESTION_BLOCK,
     HR_STARTED, HR_TEST_PASSED, HR_TEST_FAILED, HR_INTERVIEW_PASSED,
     HR_MOTIVATION_ANSWER, HR_SLOT_CHOSEN, HR_SLOT_NO_MATCH,
 )
@@ -509,15 +510,20 @@ async def finish_test(message: Message, candidate_id: int, test_num: int):
 
         answers = json.loads(session.answers_json)
 
-        # Подсчёт
+        # Подсчёт + сбор ошибок
         correct_count = 0
+        errors = []  # список (q_idx, question, given_indices, correct_indices)
         for i, q in enumerate(questions):
             if i >= len(answers):
-                break
+                # Не дошёл до этого вопроса — считаем ошибкой
+                errors.append((i, q, [], q["correct"]))
+                continue
             given = sorted(answers[i])
             correct = sorted(q["correct"])
             if given == correct:
                 correct_count += 1
+            else:
+                errors.append((i, q, given, correct))
 
         score = round(correct_count / len(questions) * 100, 1)
         threshold = PASS_THRESHOLD_TEST_1 if test_num == 1 else PASS_THRESHOLD_TEST_2
@@ -552,11 +558,14 @@ async def finish_test(message: Message, candidate_id: int, test_num: int):
         candidate.reminder_count = 0
         full_name = candidate.full_name
 
-    # Сообщение кандидату
+    # Сообщение кандидату с результатом
     if passed:
         await message.answer(TEST_PASSED.format(score=score))
     else:
         await message.answer(TEST_FAILED.format(score=score))
+
+    # Разбор ответов
+    await send_review(message, questions, errors)
 
     # Уведомление HR
     if passed:
@@ -586,6 +595,44 @@ async def finish_test(message: Message, candidate_id: int, test_num: int):
         async with get_session() as s:
             cand = (await s.execute(select(Candidate).where(Candidate.id == candidate_id))).scalar_one()
             cand.awaiting = "slot_pick"
+
+
+async def send_review(message: Message, questions: list[dict], errors: list[tuple]):
+    """Отправляет разбор ошибок кандидату после теста."""
+    if not errors:
+        await message.answer(REVIEW_INTRO_ALL_CORRECT)
+        return
+
+    await message.answer(REVIEW_INTRO_WITH_ERRORS)
+
+    # Каждый ошибочный вопрос — отдельным сообщением (чтобы не упереться в лимит 4096 символов)
+    for q_idx, q, given_indices, correct_indices in errors:
+        options = q["options"]
+
+        # Форматируем что выбрал кандидат
+        if not given_indices:
+            given_str = "— нет ответа (не успели до конца теста) —"
+        else:
+            given_options = [options[i] for i in given_indices if i < len(options)]
+            given_str = " + ".join(given_options) if given_options else "—"
+
+        # Форматируем правильный ответ
+        correct_options = [options[i] for i in correct_indices if i < len(options)]
+        correct_str = " + ".join(correct_options) if correct_options else "—"
+
+        # Извлекаем номер вопроса из текста (он начинается с "N.") или используем индекс
+        # Тексты вопросов начинаются с "1. ", "2. " и т.д. — берём как есть
+        block = REVIEW_QUESTION_BLOCK.format(
+            num=q_idx + 1,
+            question=q["text"],
+            given=given_str,
+            correct=correct_str,
+        )
+        try:
+            await message.answer(block)
+        except Exception:
+            # На всякий случай — если попался символ, ломающий HTML
+            await message.answer(block.replace("<", "&lt;").replace(">", "&gt;"))
 
 
 # ============================================================
