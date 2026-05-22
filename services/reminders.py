@@ -1,5 +1,5 @@
 """Сервис напоминаний — проверяет кандидатов каждый час."""
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 import logging
 
 from aiogram import Bot
@@ -10,6 +10,7 @@ from config import REMINDER_INTERVAL_HOURS, MAX_REMINDERS, HR_TELEGRAM_IDS
 from db.database import get_session
 from db.models import Candidate, TestSession
 from data.texts import REMINDER_TEXTS, NO_RESPONSE, HR_NO_RESPONSE, HR_TIME_EXPIRED
+from data.slots import INTERVIEW_SLOTS, slot_label
 
 log = logging.getLogger(__name__)
 
@@ -24,6 +25,79 @@ AWAITING_TO_REMINDER = {
     "test_2_start": "stage_2_pending",
     "test_2_in_progress": "test_2_pending",
 }
+
+# Соответствие коротких ключей слотов и дня недели (0 = понедельник)
+SLOT_WEEKDAYS = {
+    "mon_12": (0, time(12, 0)),
+    "wed_09": (2, time(9, 0)),
+    "fri_15": (4, time(15, 0)),
+}
+
+
+def next_slot_datetime(slot_key: str, now: datetime | None = None) -> datetime | None:
+    """Возвращает ближайший datetime для слота (в локальной/серверной зоне)."""
+    if slot_key not in SLOT_WEEKDAYS:
+        return None
+    if now is None:
+        now = datetime.utcnow()
+    target_weekday, target_time = SLOT_WEEKDAYS[slot_key]
+    days_ahead = (target_weekday - now.weekday()) % 7
+    candidate = datetime.combine(now.date(), target_time) + timedelta(days=days_ahead)
+    # Если этот день — сегодня, но время уже прошло → следующая неделя
+    if candidate <= now:
+        candidate += timedelta(days=7)
+    return candidate
+
+
+async def check_interview_reminders(bot: Bot) -> None:
+    """Напоминание кандидату о ближайшем собеседовании (за ~24 часа)."""
+    now = datetime.utcnow()
+
+    async with get_session() as s:
+        result = await s.execute(
+            select(Candidate).where(
+                Candidate.interview_slot.is_not(None),
+                Candidate.interview_slot != "no_match",
+                Candidate.interview_reminded_at.is_(None),
+                Candidate.status == "passed",
+            )
+        )
+        candidates = result.scalars().all()
+
+        for c in candidates:
+            interview_dt = next_slot_datetime(c.interview_slot, now)
+            if interview_dt is None:
+                continue
+            # Напоминаем, если до собеседования меньше 24 часов
+            if interview_dt - now <= timedelta(hours=24):
+                if not c.telegram_id:
+                    continue
+                try:
+                    await bot.send_message(
+                        c.telegram_id,
+                        f"📅 <b>Напоминание о собеседовании</b>\n\n"
+                        f"У вас завтра/сегодня собеседование:\n"
+                        f"<b>{slot_label(c.interview_slot)}</b>\n\n"
+                        f"Пожалуйста, подготовьтесь:\n"
+                        f"• Освежите в памяти материалы о компании и продуктах\n"
+                        f"• Подготовьте вопросы для нас\n"
+                        f"• Подключитесь за 5 минут до начала\n\n"
+                        f"Если что-то изменилось — напишите нам сюда."
+                    )
+                    c.interview_reminded_at = now
+                    log.info(f"Напоминание о собеседовании отправлено: {c.full_name}")
+                    # Сообщаем HR
+                    for hr_id in HR_TELEGRAM_IDS:
+                        try:
+                            await bot.send_message(
+                                hr_id,
+                                f"🔔 Кандидату <b>{c.full_name}</b> отправлено напоминание о собеседовании "
+                                f"({slot_label(c.interview_slot)})."
+                            )
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log.error(f"Не удалось напомнить о собеседовании {c.full_name}: {e}")
 
 
 async def check_and_send_reminders(bot: Bot) -> None:
@@ -125,6 +199,14 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
         hours=REMINDER_INTERVAL_HOURS,
         args=[bot],
         next_run_time=datetime.utcnow() + timedelta(minutes=1),
+    )
+    # Напоминания о собеседовании — проверяем тоже каждый час
+    scheduler.add_job(
+        check_interview_reminders,
+        trigger="interval",
+        hours=1,
+        args=[bot],
+        next_run_time=datetime.utcnow() + timedelta(minutes=2),
     )
     scheduler.start()
     log.info(f"Планировщик запущен, интервал = {REMINDER_INTERVAL_HOURS}ч")
