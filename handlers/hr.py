@@ -37,6 +37,7 @@ BTN_SLOTS = "📅 Слоты"
 BTN_STATS = "📊 Статистика"
 BTN_ANALYTICS = "📈 Аналитика"
 BTN_EXPORT = "📥 Экспорт CSV"
+BTN_DELETE = "🗑 Удалить кандидата"
 BTN_HELP = "❓ Помощь"
 
 
@@ -47,7 +48,8 @@ def kb_hr_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_LIST)],
             [KeyboardButton(text=BTN_ACTIVE), KeyboardButton(text=BTN_SLOTS)],
             [KeyboardButton(text=BTN_STATS), KeyboardButton(text=BTN_ANALYTICS)],
-            [KeyboardButton(text=BTN_EXPORT), KeyboardButton(text=BTN_HELP)],
+            [KeyboardButton(text=BTN_EXPORT), KeyboardButton(text=BTN_DELETE)],
+            [KeyboardButton(text=BTN_HELP)],
         ],
         resize_keyboard=True,
         input_field_placeholder="Выберите действие или введите команду",
@@ -1409,3 +1411,123 @@ async def cb_hr_pause(callback: CallbackQuery, bot: Bot):
     )
     await callback.message.answer(msg)
     await callback.answer("На паузе" if ok else "Ошибка", show_alert=not ok)
+
+# ============================================================
+# КНОПКА «🗑 Удалить кандидата» С ВЫБОРОМ ИЗ СПИСКА
+# ============================================================
+# Поток: рекрутер тапает «🗑 Удалить кандидата» → бот показывает список
+# активных кандидатов с inline-кнопками (по одной на каждого, с ФИО и ID).
+# Тап по кандидату → стандартное подтверждение «Точно удалить?» (используем
+# kb_confirm_delete и существующие confirm_delete / cancel_delete).
+
+DELETE_LIST_LIMIT = 30  # максимум кандидатов на одном экране выбора
+
+
+def kb_delete_pick(candidates: list[Candidate]) -> InlineKeyboardMarkup:
+    """Inline-клавиатура: по одной строке на кандидата для выбора удаления."""
+    rows = []
+    for c in candidates:
+        # Маркер статуса перед именем — чтобы рекрутер видел, кого опасно удалять
+        status_mark = {
+            "active": "🔥",
+            "passed": "✅",
+            "failed": "❌",
+            "rejected": "🚫",
+            "offer_sent": "💼",
+            "on_pause": "⏸",
+            "no_response": "📵",
+        }.get(c.status, "•")
+        label = f"{status_mark} #{c.id} {c.full_name[:35]}"
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"del_pick_{c.id}",
+        )])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="del_pick_cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(StateFilter(None), F.text == BTN_DELETE, F.from_user.id.func(is_hr))
+async def btn_delete(message: Message):
+    """Показать список кандидатов для выбора удаления."""
+    async with get_session() as s:
+        # Сначала активные/недавние, потом архивные. Сортируем по убыванию ID
+        # (самые новые сверху — обычно их и хотят удалить, если ошиблись при /add).
+        r = await s.execute(
+            select(Candidate)
+            .order_by(Candidate.id.desc())
+            .limit(DELETE_LIST_LIMIT)
+        )
+        candidates = r.scalars().all()
+
+    if not candidates:
+        await message.answer("В базе нет кандидатов — удалять нечего.")
+        return
+
+    # Считаем сколько всего в базе — чтобы предупредить о лимите экрана
+    async with get_session() as s:
+        r = await s.execute(select(func.count(Candidate.id)))
+        total = r.scalar() or 0
+
+    text = "<b>🗑 Кого удалить?</b>\n\nТапните по кандидату, чтобы выбрать его для удаления."
+    if total > DELETE_LIST_LIMIT:
+        text += (
+            f"\n\n<i>Показаны последние {DELETE_LIST_LIMIT} из {total} кандидатов. "
+            f"Если нужного нет в списке — используйте команду /delete ID.</i>"
+        )
+
+    await message.answer(text, reply_markup=kb_delete_pick(candidates))
+
+
+@router.callback_query(F.data == "del_pick_cancel")
+async def cb_delete_pick_cancel(callback: CallbackQuery):
+    if not is_hr(callback.from_user.id):
+        await callback.answer()
+        return
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer("Удаление отменено.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("del_pick_"))
+async def cb_delete_pick(callback: CallbackQuery):
+    """Клик по кандидату в списке — показать подтверждение."""
+    if not is_hr(callback.from_user.id):
+        await callback.answer()
+        return
+    cid = int(callback.data[len("del_pick_"):])
+
+    async with get_session() as s:
+        r = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = r.scalar_one_or_none()
+        if not c:
+            await callback.answer("Кандидат уже удалён.", show_alert=True)
+            return
+        name = c.full_name
+        status = c.status
+        stage = c.stage
+
+    # Убираем кнопки списка из старого сообщения, чтобы не нажали повторно
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    stage_names = {
+        0: "не начал", 1: "видео 1 / тест 1", 2: "мотивация",
+        3: "видео 2 / тест 2", 4: "тесты пройдены", 5: "на кейсах", 6: "финал"
+    }
+    await callback.message.answer(
+        f"⚠️ Удалить кандидата <b>{name}</b> (#{cid})?\n\n"
+        f"Этап: {stage_names.get(stage, '?')}\n"
+        f"Статус: <b>{status}</b>\n\n"
+        f"Это действие <b>необратимо</b>. Будут удалены:\n"
+        f"• Карточка кандидата\n"
+        f"• Все результаты тестов\n"
+        f"• Все активные сессии тестов\n"
+        f"• Ссылка-приглашение перестанет работать",
+        reply_markup=kb_confirm_delete(cid),
+    )
+    await callback.answer()
