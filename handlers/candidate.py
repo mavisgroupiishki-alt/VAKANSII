@@ -592,49 +592,102 @@ async def finish_test(message: Message, candidate_id: int, test_num: int):
 # МОТИВАЦИОННЫЙ ВОПРОС (между тестами)
 # ============================================================
 @router.message(F.text & ~F.text.startswith("/"))
-async def handle_motivation(message: Message, bot: Bot):
+async def handle_text_messages(message: Message, bot: Bot):
+    """Универсальный обработчик для свободного текста кандидата.
+
+    Срабатывает только для тех, кто в базе и от кого ожидается текстовый ввод:
+    - motivation_answer — мотивационный ответ после теста 1
+    - phone_correction — корректный телефон / комментарий после «Время не подходит»
+    """
     candidate = await get_candidate(message.from_user.id)
-    if not candidate or candidate.awaiting != "motivation_answer":
+    if not candidate:
         return
 
-    answer = message.text.strip()
-    if len(answer) < 10:
-        await message.answer("Пожалуйста, напишите более развёрнутый ответ (хотя бы пару предложений).")
-        return
+    # --- Мотивационный ответ ---
+    if candidate.awaiting == "motivation_answer":
+        answer = message.text.strip()
+        if len(answer) < 10:
+            await message.answer("Пожалуйста, напишите более развёрнутый ответ (хотя бы пару предложений).")
+            return
 
-    async with get_session() as s:
-        result = await s.execute(select(Candidate).where(Candidate.id == candidate.id))
-        c = result.scalar_one()
-        c.motivation_answer = answer
-        c.stage = 3  # Готов к видео 2
-        c.awaiting = "video_2_watched"
-        c.last_activity_at = datetime.utcnow()
-        c.reminder_count = 0
-        full_name = c.full_name
+        async with get_session() as s:
+            result = await s.execute(select(Candidate).where(Candidate.id == candidate.id))
+            c = result.scalar_one()
+            c.motivation_answer = answer
+            c.stage = 3  # Готов к видео 2
+            c.awaiting = "video_2_watched"
+            c.last_activity_at = datetime.utcnow()
+            c.reminder_count = 0
+            full_name = c.full_name
 
-    await message.answer(MOTIVATION_RECEIVED)
+        await message.answer(MOTIVATION_RECEIVED)
+        await notify_hr(bot, HR_MOTIVATION_ANSWER.format(name=full_name, answer=answer))
 
-    # Отправляем HR ответ
-    await notify_hr(bot, HR_MOTIVATION_ANSWER.format(name=full_name, answer=answer))
-
-    # Запускаем этап 2
-    await message.answer(
-        STAGE_2_INTRO.format(materials_url=MATERIALS_URL),
-        disable_web_page_preview=False,
-    )
-    # Видео 2 — отправляем файлом
-    video_2 = Path(VIDEO_2_PATH)
-    if video_2.exists():
-        await message.answer_video(
-            video=FSInputFile(video_2),
-            caption="📹 Видео о продуктах Mavis Group",
-            reply_markup=kb_watched_video_2(),
-        )
-    else:
+        # Запускаем этап 2
         await message.answer(
-            "⚠️ Видео временно недоступно. Уведомите рекрутера.",
-            reply_markup=kb_watched_video_2(),
+            STAGE_2_INTRO.format(materials_url=MATERIALS_URL),
+            disable_web_page_preview=False,
         )
+        video_2 = Path(VIDEO_2_PATH)
+        if video_2.exists():
+            await message.answer_video(
+                video=FSInputFile(video_2),
+                caption="📹 Видео о продуктах Mavis Group",
+                reply_markup=kb_watched_video_2(),
+            )
+        else:
+            await message.answer(
+                "⚠️ Видео временно недоступно. Уведомите рекрутера.",
+                reply_markup=kb_watched_video_2(),
+            )
+        return
+
+    # --- Коррекция контактов после «Время не подходит» ---
+    if candidate.awaiting == "phone_correction":
+        text = message.text.strip()
+
+        # Если в сообщении похоже на телефон — обновляем поле phone
+        digits = "".join(ch for ch in text if ch.isdigit())
+        is_phone_like = len(digits) >= 9  # минимум 9 цифр = похож на телефон
+
+        async with get_session() as s:
+            result = await s.execute(select(Candidate).where(Candidate.id == candidate.id))
+            c = result.scalar_one()
+            old_phone = c.phone
+            if is_phone_like:
+                # Сохраняем как новый телефон (с исходным форматированием)
+                c.phone = text[:32]
+            c.last_activity_at = datetime.utcnow()
+            c.awaiting = None  # больше ничего не ждём — рекрутер сам свяжется
+            full_name = c.full_name
+            username = c.username or "—"
+            new_phone = c.phone or "—"
+
+        # Подтверждение кандидату
+        if is_phone_like:
+            await message.answer(
+                f"✅ Спасибо! Записали ваш контакт: <b>{text}</b>\n\n"
+                f"Рекрутер свяжется с вами в ближайшее время для подбора удобного времени."
+            )
+        else:
+            await message.answer(
+                "✅ Спасибо! Передали ваше сообщение рекрутеру. "
+                "Он свяжется с вами в ближайшее время."
+            )
+
+        # Уведомляем HR
+        hr_msg = (
+            f"📝 Кандидат <b>{full_name}</b> прислал сообщение после «Время не подходит»:\n\n"
+            f"<i>«{text}»</i>\n\n"
+        )
+        if is_phone_like and text != old_phone:
+            hr_msg += f"📱 <b>Телефон обновлён:</b> {old_phone or '—'} → <b>{new_phone}</b>\n"
+        hr_msg += f"Telegram: @{username}"
+        await notify_hr(bot, hr_msg)
+        return
+
+    # В остальных случаях молчим (например, если кандидат пишет произвольный текст
+    # без ожидания — это нормально, бот не должен спамить)
 
 
 # ============================================================
@@ -687,7 +740,8 @@ async def handle_slot_choice(callback: CallbackQuery, bot: Bot):
         c = result.scalar_one()
         c.interview_slot = payload
         c.stage = 5  # на этапе кейсов
-        c.awaiting = None  # больше ничего не ждём от кандидата
+        # Если "не подходит" — ждём ответ кандидата (с корректным телефоном или комментарием)
+        c.awaiting = "phone_correction" if is_no_match else None
         c.last_activity_at = datetime.utcnow()
         c.reminder_count = 0
         full_name = c.full_name
