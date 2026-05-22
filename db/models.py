@@ -49,6 +49,12 @@ class Candidate(Base):
     # или "no_match" если кандидат нажал «Время не подходит»
     interview_slot: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # Источник кандидата: hh, telegram, recommendation, ad, other и т.д.
+    source: Mapped[str | None] = mapped_column(String(32), nullable=True)
+
+    # Когда отправили напоминание о собеседовании (чтобы не дублировать)
+    interview_reminded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
     test_results: Mapped[list["TestResult"]] = relationship(
         back_populates="candidate", cascade="all, delete-orphan"
     )
