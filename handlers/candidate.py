@@ -131,10 +131,32 @@ async def update_activity(candidate_id: int, awaiting: str | None = None) -> Non
 
 
 async def notify_hr(bot: Bot, text: str) -> None:
-    """Отправить уведомление всем рекрутерам."""
+    """Отправить уведомление всем рекрутерам (без кнопок)."""
     for hr_id in HR_TELEGRAM_IDS:
         try:
             await bot.send_message(hr_id, text)
+        except Exception as e:
+            print(f"Не удалось уведомить HR {hr_id}: {e}")
+
+
+async def notify_hr_about_candidate(
+    bot: Bot,
+    text: str,
+    candidate_id: int,
+    with_cases: bool = True,
+) -> None:
+    """Отправить уведомление с inline-кнопками действий над кандидатом.
+
+    Используется для уведомлений в контексте конкретного кандидата —
+    рекрутер сразу видит кнопки «Кейсы / Оффер / Отказ / Карточка / Пауза»
+    и не вводит ID руками.
+    """
+    # Импорт здесь, чтобы избежать циклической зависимости candidate <-> hr
+    from handlers.hr import kb_candidate_actions
+    kb = kb_candidate_actions(candidate_id, with_cases=with_cases)
+    for hr_id in HR_TELEGRAM_IDS:
+        try:
+            await bot.send_message(hr_id, text, reply_markup=kb)
         except Exception as e:
             print(f"Не удалось уведомить HR {hr_id}: {e}")
 
@@ -189,9 +211,12 @@ async def cmd_start(message: Message, bot: Bot):
         # Перечитаем кандидата свежим запросом
         candidate = await get_candidate(message.from_user.id)
         # Уведомляем HR об активации
-        await notify_hr(
+        await notify_hr_about_candidate(
             bot,
-            f"✅ Кандидат <b>{full_name_local}</b> (#{candidate_id_local}) активировал приглашение и начал собеседование."
+            f"✅ Кандидат <b>{full_name_local}</b> (#{candidate_id_local}) "
+            f"активировал приглашение и начал собеседование.",
+            candidate_id=candidate_id_local,
+            with_cases=False,
         )
 
     if not candidate:
@@ -215,16 +240,172 @@ async def cmd_start(message: Message, bot: Bot):
             WELCOME.format(name=candidate.full_name.split()[0]),
             reply_markup=kb_start_journey(),
         )
-        await notify_hr(bot, HR_STARTED.format(name=candidate.full_name))
+        await notify_hr_about_candidate(
+            bot,
+            HR_STARTED.format(name=candidate.full_name),
+            candidate_id=candidate.id,
+            with_cases=False,
+        )
     elif candidate.stage == 6 or candidate.status in ("failed", "rejected", "no_response"):
         await message.answer("Процесс собеседования уже завершён. Спасибо!")
     else:
-        # Возобновление
+        # Возобновление — восстанавливаем состояние, на котором кандидат остановился,
+        # и присылаем нужную клавиатуру, чтобы он мог продолжить.
+        await resume_journey(message, candidate)
+
+
+async def resume_journey(message: Message, candidate: Candidate) -> None:
+    """Восстанавливает кандидата на той точке воронки, где он остановился.
+
+    Вызывается из /start, когда у кандидата уже есть запись в БД и он не на финале.
+    Чтобы не оставить кандидата без кнопок («тупик»), для каждого возможного
+    awaiting-состояния присылается соответствующий призыв к действию + клавиатура.
+    """
+    name = candidate.full_name.split()[0]
+    greeting = f"С возвращением, {name}!\n\n"
+    stage = candidate.stage
+    awaiting = candidate.awaiting
+
+    # --- Этап 1: видео + тест 1 ---------------------------------------------
+    if stage == 1:
+        # Активная сессия теста? — продолжаем с текущего вопроса
+        async with get_session() as s:
+            r = await s.execute(
+                select(TestSession).where(
+                    TestSession.candidate_id == candidate.id,
+                    TestSession.test_number == 1,
+                    TestSession.is_active.is_(True),
+                )
+            )
+            session = r.scalar_one_or_none()
+
+        if session and datetime.utcnow() < session.deadline:
+            selected = json.loads(session.selected_options) if session.selected_options else []
+            await message.answer(
+                greeting + "Продолжаем <b>Тест №1</b> с того места, где вы остановились."
+            )
+            await send_question(message, candidate.id, 1, session.current_question, selected)
+            return
+
+        if session and datetime.utcnow() >= session.deadline:
+            # Сессия просрочена — закрываем её и сообщаем
+            async with get_session() as s:
+                r = await s.execute(
+                    select(TestSession).where(TestSession.id == session.id)
+                )
+                old = r.scalar_one()
+                old.is_active = False
+            await message.answer(
+                greeting + "⏰ К сожалению, время на прохождение Теста №1 истекло. "
+                "Если вы хотите пересдать — напишите рекрутеру."
+            )
+            return
+
+        if awaiting == "test_1_start":
+            questions = get_questions(1)
+            await message.answer(
+                greeting + TEST_1_START.format(total=len(questions)),
+                reply_markup=kb_start_test(1),
+            )
+            return
+
+        # По умолчанию для этапа 1 — кандидат ещё не подтвердил видео
         await message.answer(
-            f"С возвращением, {candidate.full_name.split()[0]}!\n\n"
-            "Вы можете продолжить с того места, где остановились. "
-            "Если кнопок не видно — напишите рекрутеру."
+            greeting + "Вы остановились на просмотре видео о Mavis Group. "
+            "Когда закончите — нажмите кнопку ниже.",
+            reply_markup=kb_watched_video_1(),
         )
+        return
+
+    # --- Этап 2: мотивационный вопрос ---------------------------------------
+    if stage == 2:
+        await message.answer(
+            greeting + MOTIVATION_QUESTION + "\n\n"
+            "<i>Напишите ответ обычным сообщением.</i>"
+        )
+        return
+
+    # --- Этап 3: видео 2 + тест 2 -------------------------------------------
+    if stage == 3:
+        async with get_session() as s:
+            r = await s.execute(
+                select(TestSession).where(
+                    TestSession.candidate_id == candidate.id,
+                    TestSession.test_number == 2,
+                    TestSession.is_active.is_(True),
+                )
+            )
+            session = r.scalar_one_or_none()
+
+        if session and datetime.utcnow() < session.deadline:
+            selected = json.loads(session.selected_options) if session.selected_options else []
+            await message.answer(
+                greeting + "Продолжаем <b>Тест №2</b> с того места, где вы остановились."
+            )
+            await send_question(message, candidate.id, 2, session.current_question, selected)
+            return
+
+        if session and datetime.utcnow() >= session.deadline:
+            async with get_session() as s:
+                r = await s.execute(
+                    select(TestSession).where(TestSession.id == session.id)
+                )
+                old = r.scalar_one()
+                old.is_active = False
+            await message.answer(
+                greeting + "⏰ К сожалению, время на прохождение Теста №2 истекло. "
+                "Если вы хотите пересдать — напишите рекрутеру."
+            )
+            return
+
+        if awaiting == "test_2_start":
+            questions = get_questions(2)
+            await message.answer(
+                greeting + TEST_2_START.format(total=len(questions)),
+                reply_markup=kb_start_test(2),
+            )
+            return
+
+        await message.answer(
+            greeting + "Вы остановились на просмотре видео о продуктах. "
+            "Когда закончите — нажмите кнопку ниже.",
+            reply_markup=kb_watched_video_2(),
+        )
+        return
+
+    # --- Этап 4: оба теста пройдены, выбор слота ---------------------------
+    if stage == 4:
+        if candidate.interview_slot:
+            await message.answer(
+                greeting + "Вы уже выбрали время собеседования. "
+                "Рекрутер свяжется с вами для подтверждения."
+            )
+            return
+        await message.answer(
+            greeting + INTERVIEW_PASSED,
+            reply_markup=kb_interview_slots(),
+        )
+        return
+
+    # --- Этап 5: на кейсах ---------------------------------------------------
+    if stage == 5:
+        if awaiting == "phone_correction":
+            await message.answer(
+                greeting + "Вы указали, что предложенные слоты вам не подходят. "
+                "Напишите, пожалуйста, удобный номер телефона или комментарий — "
+                "рекрутер свяжется с вами лично."
+            )
+            return
+        await message.answer(
+            greeting + "Вы дошли до этапа собеседования. "
+            "Рекрутер свяжется с вами для уточнения деталей."
+        )
+        return
+
+    # --- Fallback (на всякий случай — если stage неизвестен) ----------------
+    await message.answer(
+        greeting + "Рекрутер свяжется с вами в ближайшее время."
+    )
 
 
 # ============================================================
@@ -569,14 +750,24 @@ async def finish_test(message: Message, candidate_id: int, test_num: int):
 
     # Уведомление HR
     if passed:
-        await notify_hr(bot, HR_TEST_PASSED.format(
-            name=full_name, test_num=test_num, score=score,
-            stage=("Тест 1 пройден, ждём мотивацию" if test_num == 1 else "Оба теста пройдены")
-        ))
+        # Тест 1 — кейсы пока рано (впереди мотивация и тест 2).
+        # Тест 2 — оба теста пройдены, можно выдавать кейсы.
+        await notify_hr_about_candidate(
+            bot,
+            HR_TEST_PASSED.format(
+                name=full_name, test_num=test_num, score=score,
+                stage=("Тест 1 пройден, ждём мотивацию" if test_num == 1 else "Оба теста пройдены")
+            ),
+            candidate_id=candidate_id,
+            with_cases=(test_num == 2),
+        )
     else:
-        await notify_hr(bot, HR_TEST_FAILED.format(
-            name=full_name, test_num=test_num, score=score
-        ))
+        await notify_hr_about_candidate(
+            bot,
+            HR_TEST_FAILED.format(name=full_name, test_num=test_num, score=score),
+            candidate_id=candidate_id,
+            with_cases=False,
+        )
 
     # Дальнейшие шаги
     if passed and test_num == 1:
@@ -588,9 +779,12 @@ async def finish_test(message: Message, candidate_id: int, test_num: int):
             INTERVIEW_PASSED,
             reply_markup=kb_interview_slots(),
         )
-        await notify_hr(bot, HR_INTERVIEW_PASSED.format(
-            name=full_name, candidate_id=candidate_id
-        ))
+        await notify_hr_about_candidate(
+            bot,
+            HR_INTERVIEW_PASSED.format(name=full_name, candidate_id=candidate_id),
+            candidate_id=candidate_id,
+            with_cases=True,
+        )
         # Обновляем awaiting, чтобы напоминания при необходимости работали
         async with get_session() as s:
             cand = (await s.execute(select(Candidate).where(Candidate.id == candidate_id))).scalar_one()
@@ -668,7 +862,12 @@ async def handle_text_messages(message: Message, bot: Bot):
             full_name = c.full_name
 
         await message.answer(MOTIVATION_RECEIVED)
-        await notify_hr(bot, HR_MOTIVATION_ANSWER.format(name=full_name, answer=answer))
+        await notify_hr_about_candidate(
+            bot,
+            HR_MOTIVATION_ANSWER.format(name=full_name, answer=answer),
+            candidate_id=candidate.id,
+            with_cases=False,
+        )
 
         # Запускаем этап 2
         await message.answer(STAGE_2_INTRO)
@@ -802,22 +1001,32 @@ async def handle_slot_choice(callback: CallbackQuery, bot: Bot):
     if is_no_match:
         # Кандидат не может в предложенное время
         await callback.message.answer(SLOT_NO_MATCH.format(phone=phone))
-        await notify_hr(bot, HR_SLOT_NO_MATCH.format(
-            name=full_name,
+        await notify_hr_about_candidate(
+            bot,
+            HR_SLOT_NO_MATCH.format(
+                name=full_name,
+                candidate_id=candidate_id,
+                username=username,
+                phone=phone,
+            ),
             candidate_id=candidate_id,
-            username=username,
-            phone=phone,
-        ))
+            with_cases=True,
+        )
     else:
         # Кандидат выбрал слот
         label = slot_label(payload)
         await callback.message.answer(SLOT_CHOSEN.format(slot_label=label))
-        await notify_hr(bot, HR_SLOT_CHOSEN.format(
-            name=full_name,
+        await notify_hr_about_candidate(
+            bot,
+            HR_SLOT_CHOSEN.format(
+                name=full_name,
+                candidate_id=candidate_id,
+                slot_label=label,
+                username=username,
+                phone=phone,
+            ),
             candidate_id=candidate_id,
-            slot_label=label,
-            username=username,
-            phone=phone,
-        ))
+            with_cases=True,
+        )
 
     await callback.answer()

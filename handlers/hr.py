@@ -1,4 +1,4 @@
-"""Хендлеры для рекрутера — админ-команды."""
+"""Хендлеры для рекрутера — админ-команды + кнопочное меню."""
 import csv
 import io
 import secrets
@@ -6,12 +6,13 @@ import os
 from datetime import datetime
 
 from aiogram import Router, Bot, F
-from aiogram.filters import Command
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     Message, BufferedInputFile, CallbackQuery,
     InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup, KeyboardButton,
 )
 from sqlalchemy import select, func, delete
 
@@ -22,6 +23,85 @@ from data.texts import CASES_TEMPLATE, HR_NEW_CANDIDATE_ADDED
 from data.sources import SOURCES, source_label
 
 router = Router()
+
+
+# ============================================================
+# REPLY-КЛАВИАТУРА РЕКРУТЕРА (постоянная, под полем ввода)
+# ============================================================
+# Тексты кнопок — это то, что бот будет получать как обычный текст.
+# По этому тексту мы маршрутизируем в нужный обработчик.
+BTN_ADD = "➕ Добавить кандидата"
+BTN_LIST = "📋 Все кандидаты"
+BTN_ACTIVE = "🔥 Активные"
+BTN_SLOTS = "📅 Слоты"
+BTN_STATS = "📊 Статистика"
+BTN_ANALYTICS = "📈 Аналитика"
+BTN_EXPORT = "📥 Экспорт CSV"
+BTN_HELP = "❓ Помощь"
+
+
+def kb_hr_menu() -> ReplyKeyboardMarkup:
+    """Постоянное меню рекрутера под полем ввода."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_ADD), KeyboardButton(text=BTN_LIST)],
+            [KeyboardButton(text=BTN_ACTIVE), KeyboardButton(text=BTN_SLOTS)],
+            [KeyboardButton(text=BTN_STATS), KeyboardButton(text=BTN_ANALYTICS)],
+            [KeyboardButton(text=BTN_EXPORT), KeyboardButton(text=BTN_HELP)],
+        ],
+        resize_keyboard=True,
+        input_field_placeholder="Выберите действие или введите команду",
+    )
+
+
+def kb_candidate_actions(cid: int, *, with_cases: bool = True) -> InlineKeyboardMarkup:
+    """Inline-кнопки действий над конкретным кандидатом.
+
+    Кладутся под уведомления, чтобы рекрутер не вводил ID руками.
+    with_cases=False — для уведомлений на ранних этапах (видео/тест 1),
+    когда выдавать кейсы рано.
+    """
+    rows = []
+    if with_cases:
+        rows.append([
+            InlineKeyboardButton(text="📋 Кейсы", callback_data=f"hr_cases_{cid}"),
+            InlineKeyboardButton(text="👤 Карточка", callback_data=f"hr_card_{cid}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="💼 Оффер", callback_data=f"hr_offer_{cid}"),
+            InlineKeyboardButton(text="❌ Отказ", callback_data=f"hr_reject_{cid}"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="⏸ Пауза", callback_data=f"hr_pause_{cid}"),
+        ])
+    else:
+        rows.append([
+            InlineKeyboardButton(text="👤 Карточка", callback_data=f"hr_card_{cid}"),
+            InlineKeyboardButton(text="⏸ Пауза", callback_data=f"hr_pause_{cid}"),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ============================================================
+# /start для рекрутера — показывает постоянное меню
+# ============================================================
+# Фильтр is_hr через magic-filter: для не-HR обработчик не сработает,
+# и /start уйдёт в candidate.py (там свой CommandStart).
+@router.message(Command("start"), F.from_user.id.func(is_hr))
+async def hr_cmd_start(message: Message):
+    await message.answer(
+        "<b>👋 Mavis HR Bot</b>\n\n"
+        "Используйте кнопки ниже для основных действий. "
+        "Для конкретного кандидата действия появляются прямо в уведомлениях о нём.\n\n"
+        "Если нужны редкие команды — /help.",
+        reply_markup=kb_hr_menu(),
+    )
+
+
+@router.message(Command("menu"), F.from_user.id.func(is_hr))
+async def hr_cmd_menu(message: Message):
+    """Принудительно показать меню (если рекрутер случайно его закрыл)."""
+    await message.answer("Меню обновлено.", reply_markup=kb_hr_menu())
 
 
 # ============================================================
@@ -69,6 +149,8 @@ async def cmd_help(message: Message):
         return
     text = (
         "<b>🛠 Команды рекрутера</b>\n\n"
+        "<i>Большинство действий доступно через кнопки внизу экрана. "
+        "Команды нужны только для редких операций.</i>\n\n"
         "<b>Добавление:</b>\n"
         "/add — добавить кандидата (выдаст ссылку-приглашение)\n"
         "/bulk_add — массово добавить кандидатов списком\n\n"
@@ -90,10 +172,11 @@ async def cmd_help(message: Message):
         "/notify ID текст — отправить сообщение кандидату\n"
         "/delete ID — удалить кандидата 🗑\n\n"
         "<b>Прочее:</b>\n"
+        "/menu — показать кнопки меню\n"
         "/myid — мой Telegram ID\n"
         "/cancel — прервать текущую операцию"
     )
-    await message.answer(text)
+    await message.answer(text, reply_markup=kb_hr_menu())
 
 
 @router.message(Command("myid"))
@@ -1115,3 +1198,214 @@ async def cmd_analytics(message: Message):
         BufferedInputFile(buf2.read(), filename="sources.png"),
         caption="📈 Источники и средние результаты тестов",
     )
+
+
+# ============================================================
+# ОБРАБОТЧИКИ REPLY-КНОПОК (постоянное меню)
+# ============================================================
+# Кнопки шлют боту обычный текст — ловим его и вызываем нужный handler.
+# StateFilter(None) важен: внутри FSM (например, AddCandidate.waiting_full_name)
+# мы НЕ хотим, чтобы текст "📋 Все кандидаты" интерпретировался как ФИО.
+# Когда FSM не пустой — пользователь сам должен выйти через /cancel.
+
+
+@router.message(StateFilter(None), F.text == BTN_ADD, F.from_user.id.func(is_hr))
+async def btn_add(message: Message, state: FSMContext):
+    await add_start(message, state)
+
+
+@router.message(StateFilter(None), F.text == BTN_LIST, F.from_user.id.func(is_hr))
+async def btn_list(message: Message):
+    await cmd_list(message)
+
+
+@router.message(StateFilter(None), F.text == BTN_ACTIVE, F.from_user.id.func(is_hr))
+async def btn_active(message: Message):
+    await cmd_active(message)
+
+
+@router.message(StateFilter(None), F.text == BTN_SLOTS, F.from_user.id.func(is_hr))
+async def btn_slots(message: Message):
+    await cmd_slots(message)
+
+
+@router.message(StateFilter(None), F.text == BTN_STATS, F.from_user.id.func(is_hr))
+async def btn_stats(message: Message):
+    await cmd_stats(message)
+
+
+@router.message(StateFilter(None), F.text == BTN_ANALYTICS, F.from_user.id.func(is_hr))
+async def btn_analytics(message: Message):
+    await cmd_analytics(message)
+
+
+@router.message(StateFilter(None), F.text == BTN_EXPORT, F.from_user.id.func(is_hr))
+async def btn_export(message: Message):
+    await cmd_export(message)
+
+
+@router.message(StateFilter(None), F.text == BTN_HELP, F.from_user.id.func(is_hr))
+async def btn_help(message: Message):
+    await cmd_help(message)
+
+
+# ============================================================
+# INLINE-КНОПКИ ДЕЙСТВИЙ НАД КАНДИДАТОМ
+# ============================================================
+# Под уведомлениями о кандидате — чтобы рекрутер мог тапнуть
+# «Кейсы / Оффер / Отказ / Карточка / Пауза» без ввода ID руками.
+
+
+@router.callback_query(F.data.startswith("hr_cases_"))
+async def cb_hr_cases(callback: CallbackQuery):
+    if not is_hr(callback.from_user.id):
+        await callback.answer()
+        return
+    cid = int(callback.data[len("hr_cases_"):])
+
+    async with get_session() as s:
+        r = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = r.scalar_one_or_none()
+        if not c:
+            await callback.answer("Кандидат не найден.", show_alert=True)
+            return
+        c.stage = 5
+        full_name, username, phone = c.full_name, c.username, c.phone
+
+    await callback.message.answer(
+        CASES_TEMPLATE.format(
+            name=full_name,
+            username=username or "—",
+            phone=phone or "—",
+        ),
+    )
+    await callback.answer("Кейсы выданы")
+
+
+@router.callback_query(F.data.startswith("hr_card_"))
+async def cb_hr_card(callback: CallbackQuery):
+    """Показать карточку кандидата + inline-действия под ней."""
+    if not is_hr(callback.from_user.id):
+        await callback.answer()
+        return
+    cid = int(callback.data[len("hr_card_"):])
+
+    async with get_session() as s:
+        r = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = r.scalar_one_or_none()
+        if not c:
+            await callback.answer("Кандидат не найден.", show_alert=True)
+            return
+        tr_result = await s.execute(
+            select(TestResult).where(TestResult.candidate_id == cid).order_by(TestResult.test_number)
+        )
+        results = tr_result.scalars().all()
+
+    stage_names = {
+        0: "не начал", 1: "видео 1 / тест 1", 2: "мотивация",
+        3: "видео 2 / тест 2", 4: "тесты пройдены", 5: "на кейсах", 6: "финал"
+    }
+
+    text = (
+        f"<b>👤 Кандидат #{c.id}</b>\n\n"
+        f"ФИО: <b>{c.full_name}</b>\n"
+        f"Telegram ID: <code>{c.telegram_id}</code>\n"
+        f"Username: @{c.username or '—'}\n"
+        f"Телефон: {c.phone or '—'}\n"
+        f"Источник: {source_label(c.source)}\n\n"
+        f"Этап: {stage_names.get(c.stage, '?')}\n"
+        f"Статус: <b>{c.status}</b>\n"
+        f"Добавлен: {c.added_at.strftime('%d.%m.%Y %H:%M')}\n"
+    )
+    if results:
+        text += "\n<b>Результаты тестов:</b>\n"
+        for tr in results:
+            mark = "✅" if tr.passed else "❌"
+            text += f"  {mark} Тест {tr.test_number}: <b>{tr.score_percent}%</b>\n"
+    if c.motivation_answer:
+        text += f"\n<b>💬 Мотивация:</b>\n<i>{c.motivation_answer[:500]}</i>"
+    if c.interview_slot:
+        from data.slots import slot_label
+        text += f"\n\n<b>📅 Слот:</b> {slot_label(c.interview_slot)}"
+
+    await callback.message.answer(text, reply_markup=kb_candidate_actions(cid))
+    await callback.answer()
+
+
+async def _change_status_with_notify(
+    bot: Bot,
+    cid: int,
+    new_status: str,
+    notify_kandidat_text: str | None,
+) -> tuple[bool, str]:
+    """Меняет статус кандидата + при необходимости пишет ему. Возвращает (ok, msg)."""
+    async with get_session() as s:
+        r = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = r.scalar_one_or_none()
+        if not c:
+            return False, "Кандидат не найден."
+        old_status = c.status
+        c.status = new_status
+        if new_status == "offer_sent":
+            c.stage = 6
+        tg_id = c.telegram_id
+        full_name = c.full_name
+
+    msg = f"✅ {full_name} (#{cid}): {old_status} → <b>{new_status}</b>"
+
+    if notify_kandidat_text and tg_id:
+        try:
+            await bot.send_message(tg_id, notify_kandidat_text)
+            msg += "\n✉️ Кандидату отправлено уведомление."
+        except Exception as e:
+            msg += f"\n⚠️ Не удалось уведомить кандидата: {e}"
+    return True, msg
+
+
+@router.callback_query(F.data.startswith("hr_offer_"))
+async def cb_hr_offer(callback: CallbackQuery, bot: Bot):
+    if not is_hr(callback.from_user.id):
+        await callback.answer()
+        return
+    cid = int(callback.data[len("hr_offer_"):])
+    ok, msg = await _change_status_with_notify(
+        bot, cid, "offer_sent",
+        notify_kandidat_text=(
+            "🎉 <b>Поздравляем!</b>\n\n"
+            "По итогам собеседования мы готовы сделать вам оффер. "
+            "С вами свяжется рекрутер в ближайшее время для обсуждения деталей."
+        ),
+    )
+    await callback.message.answer(msg)
+    await callback.answer("Оффер" if ok else "Ошибка", show_alert=not ok)
+
+
+@router.callback_query(F.data.startswith("hr_reject_"))
+async def cb_hr_reject(callback: CallbackQuery, bot: Bot):
+    if not is_hr(callback.from_user.id):
+        await callback.answer()
+        return
+    cid = int(callback.data[len("hr_reject_"):])
+    ok, msg = await _change_status_with_notify(
+        bot, cid, "rejected",
+        notify_kandidat_text=(
+            "Благодарим вас за участие в собеседовании. "
+            "К сожалению, мы приняли решение не продолжать с вами процесс на этом этапе. "
+            "Желаем удачи в дальнейших поисках!"
+        ),
+    )
+    await callback.message.answer(msg)
+    await callback.answer("Отказ отправлен" if ok else "Ошибка", show_alert=not ok)
+
+
+@router.callback_query(F.data.startswith("hr_pause_"))
+async def cb_hr_pause(callback: CallbackQuery, bot: Bot):
+    if not is_hr(callback.from_user.id):
+        await callback.answer()
+        return
+    cid = int(callback.data[len("hr_pause_"):])
+    ok, msg = await _change_status_with_notify(
+        bot, cid, "on_pause", notify_kandidat_text=None,
+    )
+    await callback.message.answer(msg)
+    await callback.answer("На паузе" if ok else "Ошибка", show_alert=not ok)
