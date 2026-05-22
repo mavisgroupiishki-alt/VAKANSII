@@ -28,7 +28,7 @@ from data.texts import (
     HR_STARTED, HR_TEST_PASSED, HR_TEST_FAILED, HR_INTERVIEW_PASSED,
     HR_MOTIVATION_ANSWER, HR_SLOT_CHOSEN, HR_SLOT_NO_MATCH,
 )
-from data.videos import VIDEO_1_PATH, VIDEO_2_PATH, MATERIALS_URL
+from data.videos import VIDEO_1_PATH, VIDEO_2_PATH
 
 router = Router()
 
@@ -671,10 +671,7 @@ async def handle_text_messages(message: Message, bot: Bot):
         await notify_hr(bot, HR_MOTIVATION_ANSWER.format(name=full_name, answer=answer))
 
         # Запускаем этап 2
-        await message.answer(
-            STAGE_2_INTRO.format(materials_url=MATERIALS_URL),
-            disable_web_page_preview=False,
-        )
+        await message.answer(STAGE_2_INTRO)
         video_2 = Path(VIDEO_2_PATH)
         if video_2.exists():
             await message.answer_video(
