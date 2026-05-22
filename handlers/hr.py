@@ -5,17 +5,21 @@ import secrets
 import os
 from datetime import datetime
 
-from aiogram import Router, Bot
+from aiogram import Router, Bot, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, BufferedInputFile
-from sqlalchemy import select, func
+from aiogram.types import (
+    Message, BufferedInputFile, CallbackQuery,
+    InlineKeyboardButton, InlineKeyboardMarkup,
+)
+from sqlalchemy import select, func, delete
 
 from config import is_hr
 from db.database import get_session
-from db.models import Candidate, TestResult
+from db.models import Candidate, TestResult, TestSession
 from data.texts import CASES_TEMPLATE, HR_NEW_CANDIDATE_ADDED
+from data.sources import SOURCES, source_label
 
 router = Router()
 
@@ -27,11 +31,33 @@ class AddCandidate(StatesGroup):
     waiting_full_name = State()
     waiting_phone = State()
     waiting_username = State()
+    waiting_source = State()
+
+
+class BulkAdd(StatesGroup):
+    waiting_list = State()
+    waiting_source = State()
 
 
 def _gen_invite_code() -> str:
     """Генерирует уникальный короткий код приглашения."""
     return secrets.token_urlsafe(8).replace("-", "a").replace("_", "b")[:10]
+
+
+def kb_sources() -> InlineKeyboardMarkup:
+    """Клавиатура выбора источника кандидата."""
+    rows = []
+    for key, label in SOURCES.items():
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"src_{key}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_confirm_delete(candidate_id: int) -> InlineKeyboardMarkup:
+    """Кнопки подтверждения удаления."""
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="🗑 Да, удалить", callback_data=f"del_yes_{candidate_id}"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="del_no"),
+    ]])
 
 
 # ============================================================
@@ -43,19 +69,29 @@ async def cmd_help(message: Message):
         return
     text = (
         "<b>🛠 Команды рекрутера</b>\n\n"
+        "<b>Добавление:</b>\n"
         "/add — добавить кандидата (выдаст ссылку-приглашение)\n"
+        "/bulk_add — массово добавить кандидатов списком\n\n"
+        "<b>Просмотр:</b>\n"
         "/list — список всех кандидатов\n"
         "/active — только активные\n"
         "/candidate ID — карточка кандидата\n"
         "/invite ID — показать ссылку-приглашение ещё раз\n"
+        "/slots — расписание собеседований\n"
+        "/stats — статистика по воронке\n"
+        "/analytics — аналитика с графиками 📊\n"
+        "/export — выгрузить CSV\n\n"
+        "<b>Управление кандидатом:</b>\n"
         "/cases ID — кейсы для собеседования\n"
-        "/slots — расписание собеседований (кто на какое время записался)\n"
         "/set_status ID статус — изменить статус\n"
         "  Статусы: active, passed, failed, on_pause, no_response, offer_sent, rejected\n"
+        "/retry ID 1 — разрешить пересдачу теста 1\n"
+        "/retry ID 2 — разрешить пересдачу теста 2\n"
         "/notify ID текст — отправить сообщение кандидату\n"
-        "/stats — статистика по воронке\n"
-        "/export — выгрузить CSV\n"
-        "/myid — мой Telegram ID"
+        "/delete ID — удалить кандидата 🗑\n\n"
+        "<b>Прочее:</b>\n"
+        "/myid — мой Telegram ID\n"
+        "/cancel — прервать текущую операцию"
     )
     await message.answer(text)
 
@@ -113,17 +149,28 @@ async def add_phone(message: Message, state: FSMContext):
 
 
 @router.message(AddCandidate.waiting_username)
-async def add_username(message: Message, state: FSMContext, bot: Bot):
+async def add_username(message: Message, state: FSMContext):
     username = message.text.strip().lstrip("@")
     if username == "-":
         username = None
+    await state.update_data(username=username)
+    await state.set_state(AddCandidate.waiting_source)
+    await message.answer(
+        "📌 Откуда пришёл кандидат? Выберите источник:",
+        reply_markup=kb_sources(),
+    )
+
+
+@router.callback_query(AddCandidate.waiting_source, F.data.startswith("src_"))
+async def add_source(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    source = callback.data[len("src_"):]
     data = await state.get_data()
 
     # Генерируем уникальный код приглашения
     invite_code = _gen_invite_code()
 
     async with get_session() as s:
-        # Защита от коллизий — крайне маловероятно, но мало ли
+        # Защита от коллизий
         for _ in range(5):
             check = await s.execute(select(Candidate).where(Candidate.invite_code == invite_code))
             if check.scalar_one_or_none() is None:
@@ -131,14 +178,15 @@ async def add_username(message: Message, state: FSMContext, bot: Bot):
             invite_code = _gen_invite_code()
 
         candidate = Candidate(
-            telegram_id=None,  # Заполнится когда кандидат кликнет ссылку
+            telegram_id=None,
             full_name=data["full_name"],
-            username=username,
+            username=data.get("username"),
             phone=data.get("phone"),
             invite_code=invite_code,
+            source=source,
             stage=0,
             status="active",
-            added_by=message.from_user.id,
+            added_by=callback.from_user.id,
             awaiting="invite_pending",
         )
         s.add(candidate)
@@ -147,12 +195,17 @@ async def add_username(message: Message, state: FSMContext, bot: Bot):
 
     await state.clear()
 
-    # Получаем username бота для формирования ссылки
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
     bot_info = await bot.get_me()
     invite_link = f"https://t.me/{bot_info.username}?start={invite_code}"
 
-    await message.answer(
-        f"✅ Кандидат <b>{data['full_name']}</b> добавлен (#{cid}).\n\n"
+    await callback.message.answer(
+        f"✅ Кандидат <b>{data['full_name']}</b> добавлен (#{cid}).\n"
+        f"Источник: <b>{source_label(source)}</b>\n\n"
         f"<b>📨 Ссылка-приглашение:</b>\n"
         f"<code>{invite_link}</code>\n\n"
         f"<b>Отправьте эту ссылку кандидату</b> любым удобным способом:\n"
@@ -162,6 +215,7 @@ async def add_username(message: Message, state: FSMContext, bot: Bot):
         f"• E-mail\n\n"
         f"Когда кандидат кликнет ссылку — бот сразу начнёт собеседование и пришлёт вам уведомление."
     )
+    await callback.answer()
 
 
 # ============================================================
@@ -299,7 +353,8 @@ async def cmd_candidate(message: Message):
         f"ФИО: <b>{c.full_name}</b>\n"
         f"Telegram ID: <code>{c.telegram_id}</code>\n"
         f"Username: @{c.username or '—'}\n"
-        f"Телефон: {c.phone or '—'}\n\n"
+        f"Телефон: {c.phone or '—'}\n"
+        f"Источник: {source_label(c.source)}\n\n"
         f"Этап: {stage_names.get(c.stage, '?')}\n"
         f"Статус: <b>{c.status}</b>\n"
         f"Добавлен: {c.added_at.strftime('%d.%m.%Y %H:%M')}\n"
@@ -519,7 +574,7 @@ async def cmd_export(message: Message):
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow([
-        "ID", "ФИО", "Telegram ID", "Username", "Телефон",
+        "ID", "ФИО", "Telegram ID", "Username", "Телефон", "Источник",
         "Этап", "Статус",
         "Тест 1 %", "Тест 2 %",
         "Мотивация",
@@ -530,6 +585,7 @@ async def cmd_export(message: Message):
         scores = tr_by_cid.get(c.id, {})
         writer.writerow([
             c.id, c.full_name, c.telegram_id, c.username or "", c.phone or "",
+            source_label(c.source) if c.source else "",
             c.stage, c.status,
             scores.get(1, ""), scores.get(2, ""),
             (c.motivation_answer or "").replace("\n", " ")[:300],
@@ -599,3 +655,463 @@ async def cmd_slots(message: Message):
         text += "<i>Никто ещё не выбрал время.</i>"
 
     await message.answer(text)
+
+
+# ============================================================
+# /delete ID — удалить кандидата
+# ============================================================
+@router.message(Command("delete"))
+async def cmd_delete(message: Message):
+    if not is_hr(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 2:
+        await message.answer("Использование: /delete &lt;ID&gt;")
+        return
+    try:
+        cid = int(parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+
+    async with get_session() as s:
+        result = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = result.scalar_one_or_none()
+        if not c:
+            await message.answer("Кандидат не найден.")
+            return
+        name = c.full_name
+
+    await message.answer(
+        f"⚠️ Удалить кандидата <b>{name}</b> (#{cid})?\n\n"
+        f"Это действие <b>необратимо</b>. Будут удалены:\n"
+        f"• Карточка кандидата\n"
+        f"• Все результаты тестов\n"
+        f"• Все активные сессии тестов\n"
+        f"• Ссылка-приглашение перестанет работать",
+        reply_markup=kb_confirm_delete(cid),
+    )
+
+
+@router.callback_query(F.data.startswith("del_yes_"))
+async def confirm_delete(callback: CallbackQuery):
+    if not is_hr(callback.from_user.id):
+        await callback.answer()
+        return
+    cid = int(callback.data[len("del_yes_"):])
+
+    async with get_session() as s:
+        result = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = result.scalar_one_or_none()
+        if not c:
+            await callback.answer("Кандидат уже удалён.", show_alert=True)
+            return
+        name = c.full_name
+        # Удаляем — cascade сам удалит test_results и test_sessions
+        await s.delete(c)
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer(f"🗑 Кандидат <b>{name}</b> (#{cid}) удалён.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "del_no")
+async def cancel_delete(callback: CallbackQuery):
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await callback.message.answer("Удаление отменено.")
+    await callback.answer()
+
+
+# ============================================================
+# /retry ID NUM — разрешить пересдачу теста
+# ============================================================
+@router.message(Command("retry"))
+async def cmd_retry(message: Message, bot: Bot):
+    if not is_hr(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer(
+            "Использование: /retry &lt;ID&gt; &lt;номер_теста&gt;\n\n"
+            "Например: /retry 5 1 — разрешить кандидату #5 пересдать тест 1"
+        )
+        return
+    try:
+        cid = int(parts[1])
+        test_num = int(parts[2])
+    except ValueError:
+        await message.answer("ID и номер теста должны быть числами.")
+        return
+    if test_num not in (1, 2):
+        await message.answer("Номер теста — только 1 или 2.")
+        return
+
+    async with get_session() as s:
+        result = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = result.scalar_one_or_none()
+        if not c:
+            await message.answer("Кандидат не найден.")
+            return
+
+        # Удаляем результат и активные сессии этого теста
+        await s.execute(
+            delete(TestResult).where(
+                TestResult.candidate_id == cid,
+                TestResult.test_number == test_num,
+            )
+        )
+        await s.execute(
+            delete(TestSession).where(
+                TestSession.candidate_id == cid,
+                TestSession.test_number == test_num,
+            )
+        )
+
+        # Возвращаем кандидата к нужному этапу
+        if test_num == 1:
+            c.stage = 1
+            c.awaiting = "video_1_watched"
+        else:
+            c.stage = 3
+            c.awaiting = "video_2_watched"
+        c.status = "active"
+        c.last_activity_at = datetime.utcnow()
+        c.reminder_count = 0
+        tg_id = c.telegram_id
+        name = c.full_name
+
+    await message.answer(
+        f"✅ Кандидат <b>{name}</b> (#{cid}) может пересдать <b>Тест {test_num}</b>.\n\n"
+        f"Я только что отправил ему сообщение со ссылкой на пересдачу."
+    )
+
+    # Уведомляем кандидата
+    if tg_id:
+        try:
+            await bot.send_message(
+                tg_id,
+                f"📝 <b>Возможность пересдачи</b>\n\n"
+                f"Рекрутер открыл вам возможность пересдать <b>Тест {test_num}</b>.\n\n"
+                f"Нажмите /start, чтобы продолжить."
+            )
+        except Exception as e:
+            await message.answer(f"⚠️ Не удалось уведомить кандидата: {e}")
+
+
+# ============================================================
+# /bulk_add — массовое добавление кандидатов
+# ============================================================
+@router.message(Command("bulk_add"))
+async def bulk_add_start(message: Message, state: FSMContext):
+    if not is_hr(message.from_user.id):
+        return
+    await state.set_state(BulkAdd.waiting_list)
+    await message.answer(
+        "<b>📋 Массовое добавление кандидатов</b>\n\n"
+        "Пришлите список кандидатов одним сообщением. Каждый кандидат — одна строка в формате:\n\n"
+        "<code>ФИО | телефон | username</code>\n\n"
+        "Где username и телефон необязательны (можно поставить -).\n\n"
+        "<b>Пример:</b>\n"
+        "<code>Иванов Иван | +375291234567 | ivanov\n"
+        "Петрова Анна | +375291112233 | -\n"
+        "Сидоров Пётр | - | sidorov</code>\n\n"
+        "Или /cancel для отмены."
+    )
+
+
+@router.message(BulkAdd.waiting_list)
+async def bulk_add_list(message: Message, state: FSMContext):
+    lines = [line.strip() for line in message.text.strip().split("\n") if line.strip()]
+    if not lines:
+        await message.answer("Пустой список. Пришлите хотя бы одного кандидата.")
+        return
+
+    parsed = []
+    errors = []
+    for i, line in enumerate(lines, 1):
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) < 1 or not parts[0]:
+            errors.append(f"Строка {i}: нет ФИО")
+            continue
+        full_name = parts[0]
+        if len(full_name) < 3:
+            errors.append(f"Строка {i}: ФИО слишком короткое")
+            continue
+        phone = parts[1] if len(parts) > 1 and parts[1] not in ("-", "") else None
+        username = parts[2].lstrip("@") if len(parts) > 2 and parts[2] not in ("-", "") else None
+        parsed.append({"full_name": full_name, "phone": phone, "username": username})
+
+    if errors:
+        await message.answer(
+            "⚠️ Ошибки в списке:\n" + "\n".join(errors) +
+            f"\n\nИсправьте и пришлите заново, или /cancel."
+        )
+        return
+
+    await state.update_data(candidates=parsed)
+    await state.set_state(BulkAdd.waiting_source)
+    await message.answer(
+        f"📦 Распознано: <b>{len(parsed)} кандидатов</b>\n\n"
+        f"Все они придут из одного источника. Выберите его:",
+        reply_markup=kb_sources(),
+    )
+
+
+@router.callback_query(BulkAdd.waiting_source, F.data.startswith("src_"))
+async def bulk_add_source(callback: CallbackQuery, state: FSMContext, bot: Bot):
+    source = callback.data[len("src_"):]
+    data = await state.get_data()
+    candidates_data = data.get("candidates", [])
+
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    bot_info = await bot.get_me()
+    bot_username = bot_info.username
+
+    added = []
+    async with get_session() as s:
+        for cdata in candidates_data:
+            # Уникальный код для каждого
+            invite_code = _gen_invite_code()
+            for _ in range(5):
+                check = await s.execute(select(Candidate).where(Candidate.invite_code == invite_code))
+                if check.scalar_one_or_none() is None:
+                    break
+                invite_code = _gen_invite_code()
+
+            candidate = Candidate(
+                telegram_id=None,
+                full_name=cdata["full_name"],
+                username=cdata.get("username"),
+                phone=cdata.get("phone"),
+                invite_code=invite_code,
+                source=source,
+                stage=0,
+                status="active",
+                added_by=callback.from_user.id,
+                awaiting="invite_pending",
+            )
+            s.add(candidate)
+            await s.flush()
+            added.append({
+                "id": candidate.id,
+                "name": cdata["full_name"],
+                "phone": cdata.get("phone"),
+                "link": f"https://t.me/{bot_username}?start={invite_code}",
+            })
+
+    await state.clear()
+
+    # Шлём результат частями (по 10 кандидатов на сообщение)
+    await callback.message.answer(
+        f"✅ Добавлено <b>{len(added)}</b> кандидатов "
+        f"(источник: <b>{source_label(source)}</b>).\n\n"
+        f"Ссылки-приглашения 👇"
+    )
+
+    chunk_size = 10
+    for i in range(0, len(added), chunk_size):
+        chunk = added[i:i + chunk_size]
+        text_parts = []
+        for a in chunk:
+            phone_str = f"📱 {a['phone']}" if a['phone'] else ""
+            text_parts.append(
+                f"<b>#{a['id']} {a['name']}</b> {phone_str}\n"
+                f"<code>{a['link']}</code>"
+            )
+        await callback.message.answer("\n\n".join(text_parts))
+
+    await callback.answer()
+
+
+# ============================================================
+# /analytics — графики воронки
+# ============================================================
+@router.message(Command("analytics"))
+async def cmd_analytics(message: Message):
+    if not is_hr(message.from_user.id):
+        return
+
+    # Подгружаем тяжёлые библиотеки только при вызове команды
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from io import BytesIO
+
+    async with get_session() as s:
+        # Все кандидаты
+        r_all = await s.execute(select(Candidate))
+        all_candidates = r_all.scalars().all()
+        # Результаты тестов
+        r_tr = await s.execute(select(TestResult))
+        results = r_tr.scalars().all()
+
+    if not all_candidates:
+        await message.answer("Пока нет кандидатов для аналитики.")
+        return
+
+    total = len(all_candidates)
+
+    # ---------- Воронка ----------
+    # Считаем сколько кандидатов прошли каждый этап
+    activated = sum(1 for c in all_candidates if c.telegram_id is not None)
+    started = sum(1 for c in all_candidates if c.stage >= 1)
+    test1_passed = sum(1 for r in results if r.test_number == 1 and r.passed)
+    motivation = sum(1 for c in all_candidates if c.motivation_answer)
+    test2_passed = sum(1 for r in results if r.test_number == 2 and r.passed)
+    slot_picked = sum(1 for c in all_candidates if c.interview_slot and c.interview_slot != "no_match")
+    offer = sum(1 for c in all_candidates if c.status == "offer_sent")
+
+    stages = [
+        ("Добавлены", total),
+        ("Активировали", activated),
+        ("Прошли тест 1", test1_passed),
+        ("Мотивация", motivation),
+        ("Прошли тест 2", test2_passed),
+        ("Выбрали слот", slot_picked),
+        ("Оффер", offer),
+    ]
+
+    # ---------- График 1: воронка ----------
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    plt.rcParams['font.family'] = ['DejaVu Sans']
+
+    labels = [s[0] for s in stages]
+    values = [s[1] for s in stages]
+    colors_funnel = ['#4A90E2', '#5BA0F2', '#6BB0FF', '#7AC0FF', '#8AD0FF', '#99D9F5', '#A8E5C0']
+
+    bars = axes[0].barh(labels, values, color=colors_funnel[:len(stages)], edgecolor='white')
+    axes[0].invert_yaxis()
+    axes[0].set_title("Воронка найма", fontsize=14, fontweight='bold', pad=15)
+    axes[0].set_xlabel("Кандидатов")
+    axes[0].set_xlim(0, max(max(values), 1) * 1.15)
+    # Подписи с количеством и %
+    for i, (bar, val) in enumerate(zip(bars, values)):
+        pct = (val / total * 100) if total else 0
+        axes[0].text(bar.get_width() + max(values) * 0.01, bar.get_y() + bar.get_height() / 2,
+                     f"{val} ({pct:.0f}%)", va='center', fontsize=10)
+    axes[0].spines['top'].set_visible(False)
+    axes[0].spines['right'].set_visible(False)
+    axes[0].grid(axis='x', alpha=0.3)
+
+    # ---------- График 2: распределение по статусам ----------
+    statuses = {}
+    for c in all_candidates:
+        statuses[c.status] = statuses.get(c.status, 0) + 1
+
+    status_labels_ru = {
+        "active": "В процессе",
+        "passed": "Прошли тесты",
+        "failed": "Провалили",
+        "on_pause": "На паузе",
+        "no_response": "Не отвечают",
+        "offer_sent": "Оффер",
+        "rejected": "Отказано",
+    }
+    status_colors = {
+        "active": "#4A90E2",
+        "passed": "#7ED321",
+        "failed": "#D0021B",
+        "on_pause": "#F5A623",
+        "no_response": "#9B9B9B",
+        "offer_sent": "#50C878",
+        "rejected": "#8B0000",
+    }
+
+    labels2 = [status_labels_ru.get(s, s) for s in statuses.keys()]
+    sizes2 = list(statuses.values())
+    colors2 = [status_colors.get(s, "#CCCCCC") for s in statuses.keys()]
+
+    axes[1].pie(sizes2, labels=labels2, colors=colors2, autopct='%1.0f%%',
+                startangle=90, textprops={'fontsize': 10},
+                wedgeprops={'edgecolor': 'white', 'linewidth': 2})
+    axes[1].set_title("Распределение по статусам", fontsize=14, fontweight='bold', pad=15)
+
+    plt.tight_layout()
+
+    buf = BytesIO()
+    plt.savefig(buf, format='png', dpi=110, bbox_inches='tight', facecolor='white')
+    plt.close(fig)
+    buf.seek(0)
+
+    # ---------- График 3: источники + средние баллы ----------
+    fig2, axes2 = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Источники
+    src_counts = {}
+    for c in all_candidates:
+        key = c.source or "unknown"
+        src_counts[key] = src_counts.get(key, 0) + 1
+
+    if src_counts:
+        src_items = sorted(src_counts.items(), key=lambda x: x[1], reverse=True)
+        src_labels = [source_label(k) if k != "unknown" else "Не указан" for k, _ in src_items]
+        src_values = [v for _, v in src_items]
+        axes2[0].bar(src_labels, src_values, color='#4A90E2', edgecolor='white')
+        axes2[0].set_title("Источники кандидатов", fontsize=14, fontweight='bold', pad=15)
+        axes2[0].set_ylabel("Кандидатов")
+        plt.setp(axes2[0].get_xticklabels(), rotation=30, ha='right')
+        axes2[0].spines['top'].set_visible(False)
+        axes2[0].spines['right'].set_visible(False)
+        axes2[0].grid(axis='y', alpha=0.3)
+        for i, v in enumerate(src_values):
+            axes2[0].text(i, v + 0.1, str(v), ha='center', fontsize=10, fontweight='bold')
+
+    # Средние баллы
+    test1_scores = [r.score_percent for r in results if r.test_number == 1]
+    test2_scores = [r.score_percent for r in results if r.test_number == 2]
+    avg_t1 = sum(test1_scores) / len(test1_scores) if test1_scores else 0
+    avg_t2 = sum(test2_scores) / len(test2_scores) if test2_scores else 0
+
+    axes2[1].bar(["Тест 1", "Тест 2"], [avg_t1, avg_t2],
+                 color=['#4A90E2', '#7ED321'], edgecolor='white')
+    axes2[1].set_title("Средние результаты тестов", fontsize=14, fontweight='bold', pad=15)
+    axes2[1].set_ylabel("%")
+    axes2[1].set_ylim(0, 100)
+    axes2[1].axhline(y=85, color='#D0021B', linestyle='--', alpha=0.5, label='Порог Т1 (85%)')
+    axes2[1].axhline(y=75, color='#F5A623', linestyle='--', alpha=0.5, label='Порог Т2 (75%)')
+    axes2[1].legend(loc='lower right', fontsize=9)
+    axes2[1].spines['top'].set_visible(False)
+    axes2[1].spines['right'].set_visible(False)
+    axes2[1].grid(axis='y', alpha=0.3)
+    for i, v in enumerate([avg_t1, avg_t2]):
+        axes2[1].text(i, v + 2, f"{v:.1f}%", ha='center', fontsize=11, fontweight='bold')
+
+    plt.tight_layout()
+    buf2 = BytesIO()
+    plt.savefig(buf2, format='png', dpi=110, bbox_inches='tight', facecolor='white')
+    plt.close(fig2)
+    buf2.seek(0)
+
+    # Конверсии
+    conv_text = "<b>📊 Сводная аналитика</b>\n\n"
+    conv_text += f"Всего кандидатов: <b>{total}</b>\n"
+    if total:
+        conv_text += f"Конверсия активации: <b>{activated / total * 100:.0f}%</b> ({activated}/{total})\n"
+    if activated:
+        conv_text += f"Дошли до теста 1 → прошли: <b>{test1_passed / activated * 100:.0f}%</b>\n"
+    if test1_passed:
+        conv_text += f"Тест 1 → Тест 2 (прошли): <b>{test2_passed / test1_passed * 100:.0f}%</b>\n"
+    if test2_passed:
+        conv_text += f"Прошли тесты → выбрали слот: <b>{slot_picked / test2_passed * 100:.0f}%</b>\n"
+    if total:
+        conv_text += f"\n<b>Итоговая конверсия в оффер: {offer / total * 100:.1f}%</b>"
+
+    # Отправляем картинки
+    await message.answer_photo(
+        BufferedInputFile(buf.read(), filename="funnel.png"),
+        caption=conv_text,
+    )
+    await message.answer_photo(
+        BufferedInputFile(buf2.read(), filename="sources.png"),
+        caption="📈 Источники и средние результаты тестов",
+    )
