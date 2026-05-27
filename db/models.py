@@ -55,6 +55,14 @@ class Candidate(Base):
     # Когда отправили напоминание о собеседовании (чтобы не дублировать)
     interview_reminded_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # Позиция: support = специалист по сопровождению, sales = менеджер по продажам
+    position: Mapped[str] = mapped_column(String(32), default='support')
+
+    # Для воронки продажника
+    internship_day: Mapped[int] = mapped_column(Integer, default=0)
+    internship_step: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    sales_data: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     test_results: Mapped[list["TestResult"]] = relationship(
         back_populates="candidate", cascade="all, delete-orphan"
     )
