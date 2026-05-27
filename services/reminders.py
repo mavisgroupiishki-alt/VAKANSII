@@ -210,4 +210,15 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     )
     scheduler.start()
     log.info(f"Планировщик запущен, интервал = {REMINDER_INTERVAL_HOURS}ч")
+
+    # Напоминания стажёрам — каждое утро в 9:00
+    from handlers.sales import remind_internship_next_day
+    scheduler.add_job(
+        remind_internship_next_day,
+        trigger="cron",
+        hour=9,
+        minute=0,
+        args=[bot],
+    )
+
     return scheduler
