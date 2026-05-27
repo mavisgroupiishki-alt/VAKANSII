@@ -657,6 +657,13 @@ async def handle_text_messages(message: Message, bot: Bot):
     if not candidate:
         return
 
+    # --- Воронка продажника ---
+    if getattr(candidate, 'position', 'support') == 'sales':
+        from handlers.sales import handle_sales_text
+        handled = await handle_sales_text(message, bot)
+        if handled:
+            return
+
     # --- Мотивационный ответ ---
     if candidate.awaiting == "motivation_answer":
         answer = message.text.strip()
