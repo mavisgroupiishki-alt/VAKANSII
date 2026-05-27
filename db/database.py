@@ -41,6 +41,24 @@ async def _run_migrations(conn) -> None:
         log.info("Миграция: добавляю поле interview_reminded_at в таблицу candidates")
         await conn.execute(text("ALTER TABLE candidates ADD COLUMN interview_reminded_at DATETIME"))
 
+    # Позиция кандидата (sales / support)
+    if "position" not in columns:
+        log.info("Миграция: добавляю поле position")
+        await conn.execute(text("ALTER TABLE candidates ADD COLUMN position VARCHAR(32) DEFAULT 'support'"))
+
+    # Поля для воронки продажника
+    if "internship_day" not in columns:
+        log.info("Миграция: добавляю поле internship_day")
+        await conn.execute(text("ALTER TABLE candidates ADD COLUMN internship_day INTEGER DEFAULT 0"))
+
+    if "internship_step" not in columns:
+        log.info("Миграция: добавляю поле internship_step")
+        await conn.execute(text("ALTER TABLE candidates ADD COLUMN internship_step VARCHAR(64)"))
+
+    if "sales_data" not in columns:
+        log.info("Миграция: добавляю поле sales_data")
+        await conn.execute(text("ALTER TABLE candidates ADD COLUMN sales_data TEXT"))
+
 
 async def init_db() -> None:
     """Создать таблицы при первом запуске + миграции."""
