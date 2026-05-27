@@ -11,6 +11,7 @@ from aiohttp import web
 from config import BOT_TOKEN
 from db.database import init_db
 from handlers import hr, candidate
+from handlers import sales
 from services.reminders import setup_scheduler
 
 logging.basicConfig(
@@ -36,6 +37,7 @@ async def main() -> None:
     # Подключаем роутеры — HR раньше кандидата, чтобы команды /add и т.п.
     # перехватывались до универсального обработчика текстов в candidate.py
     dp.include_router(hr.router)
+    dp.include_router(sales.router)
     dp.include_router(candidate.router)
 
     # Запускаем планировщик напоминаний
