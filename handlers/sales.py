@@ -1,4 +1,5 @@
 """Воронка кандидата на позицию «Менеджер по продажам»."""
+import asyncio
 import json
 import logging
 from datetime import datetime, timedelta
@@ -323,16 +324,16 @@ async def cb_sales_test_start(callback: CallbackQuery, bot: Bot):
 
 
 async def _send_vtest_q(bot: Bot, tg_id: int, q_idx: int, selected: list):
-    """Отправляет вопрос теста по видео двумя сообщениями."""
+    """Отправляет вопрос теста по видео — текст + кнопки в одном сообщении."""
     q = TEST_SALES_VIDEO[q_idx]
     is_multi = q["type"] == "multi"
     header = f"<b>Вопрос {q_idx + 1}/{len(TEST_SALES_VIDEO)}</b>"
     if is_multi:
         header += "\n<i>(выберите все верные варианты)</i>"
-    await bot.send_message(tg_id, f"{header}\n\n{q['text']}")
+    # Отправляем текст и кнопки ВМЕСТЕ в одном сообщении
     await bot.send_message(
         tg_id,
-        "👇 Выберите ответ:",
+        f"{header}\n\n{q['text']}",
         reply_markup=kb_test_question(TEST_SALES_VIDEO, q_idx, selected),
     )
 
@@ -349,6 +350,17 @@ async def cb_vtest_answer(callback: CallbackQuery, bot: Bot):
     q_idx = int(parts[2]) if is_confirm else int(parts[1])
     opt_idx = None if is_confirm else int(parts[2])
 
+    # ── Шаг 1: обновляем БД, запоминаем что делать ──────────
+    do_finish    = False
+    do_next_q    = False
+    do_update_kb = False
+    next_q_idx   = None
+    finish_ans   = None
+    new_selected = None
+    q_cur_save   = None
+    tg_id = c.telegram_id
+    cid   = c.id
+
     async with get_session() as s:
         ts_r = await s.execute(select(TestSession).where(
             TestSession.candidate_id == c.id,
@@ -357,76 +369,75 @@ async def cb_vtest_answer(callback: CallbackQuery, bot: Bot):
         ))
         ts = ts_r.scalar_one_or_none()
         if not ts:
-            await bot.send_message(c.telegram_id,
-                "⚠️ Сессия теста не найдена. Напишите рекрутеру.")
+            await bot.send_message(tg_id, "⚠️ Сессия не найдена. Напишите рекрутеру.")
             return
 
         if datetime.utcnow() > ts.deadline:
             ts.is_active = False
-            await bot.send_message(c.telegram_id,
-                "⏰ Время на тест истекло. Свяжитесь с рекрутером.")
+            await bot.send_message(tg_id, "⏰ Время истекло. Свяжитесь с рекрутером.")
             return
 
-        answers = json.loads(ts.answers_json)
+        answers  = json.loads(ts.answers_json)
         selected = json.loads(ts.selected_options)
-        q_cur = ts.current_question
-        q = TEST_SALES_VIDEO[q_cur]
+        q_cur    = ts.current_question
+        q        = TEST_SALES_VIDEO[q_cur]
         is_multi = q["type"] == "multi"
-        tg_id = c.telegram_id
-        cid = c.id
+        q_cur_save = q_cur
 
         if is_confirm:
-            # Подтверждение multi
             answers.append(sorted(selected))
-            ts.answers_json = json.dumps(answers)
+            ts.answers_json   = json.dumps(answers)
             ts.selected_options = "[]"
             ts.current_question += 1
-            try:
-                await callback.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
             if ts.current_question >= len(TEST_SALES_VIDEO):
-                cand_r = await s.execute(select(Candidate).where(Candidate.id == cid))
-                cand = cand_r.scalar_one()
-                cand.awaiting = None
+                r2 = await s.execute(select(Candidate).where(Candidate.id == cid))
+                r2.scalar_one().awaiting = None
                 ts.is_active = False
-                await _finish_vtest(bot, cid, answers)
+                do_finish  = True
+                finish_ans = list(answers)
             else:
-                await _send_vtest_q(bot, tg_id, ts.current_question, [])
+                do_next_q  = True
+                next_q_idx = ts.current_question
 
         elif is_multi:
-            # Выбор варианта в multi
             if opt_idx in selected:
                 selected.remove(opt_idx)
             else:
                 selected.append(opt_idx)
             ts.selected_options = json.dumps(selected)
-            try:
-                await callback.message.edit_reply_markup(
-                    reply_markup=kb_test_question(TEST_SALES_VIDEO, q_cur, selected))
-            except Exception:
-                await bot.send_message(
-                    tg_id, "👇 Выберите ответ:",
-                    reply_markup=kb_test_question(TEST_SALES_VIDEO, q_cur, selected))
+            do_update_kb = True
+            new_selected = list(selected)
 
-        else:
-            # Ответ на single
+        else:  # single
             answers.append([opt_idx])
-            ts.answers_json = json.dumps(answers)
+            ts.answers_json   = json.dumps(answers)
             ts.current_question += 1
-            try:
-                await callback.message.edit_reply_markup(reply_markup=None)
-            except Exception:
-                pass
             if ts.current_question >= len(TEST_SALES_VIDEO):
-                cand_r = await s.execute(select(Candidate).where(Candidate.id == cid))
-                cand = cand_r.scalar_one()
-                cand.awaiting = None
+                r2 = await s.execute(select(Candidate).where(Candidate.id == cid))
+                r2.scalar_one().awaiting = None
                 ts.is_active = False
-                await _finish_vtest(bot, cid, answers)
+                do_finish  = True
+                finish_ans = list(answers)
             else:
-                await _send_vtest_q(bot, tg_id, ts.current_question, [])
+                do_next_q  = True
+                next_q_idx = ts.current_question
 
+    # ── Шаг 2: всё что связано с Telegram — ПОСЛЕ сессии БД ──
+    try:
+        await callback.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    if do_finish:
+        await _finish_vtest(bot, cid, finish_ans)
+    elif do_next_q:
+        await _send_vtest_q(bot, tg_id, next_q_idx, [])
+    elif do_update_kb:
+        try:
+            await callback.message.edit_reply_markup(
+                reply_markup=kb_test_question(TEST_SALES_VIDEO, q_cur_save, new_selected))
+        except Exception:
+            await _send_vtest_q(bot, tg_id, q_cur_save, new_selected)
 
 async def _finish_vtest(bot: Bot, cid: int, answers: list):
     """Подсчёт результата теста по видео."""
