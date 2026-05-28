@@ -29,10 +29,15 @@ INTERN_PASS = 70     # порог тестов стажировки
 # ── Helpers ──────────────────────────────────────────────────
 async def get_sales_candidate(tg_id: int) -> Candidate | None:
     async with get_session() as s:
-        r = await s.execute(
-            select(Candidate).where(Candidate.telegram_id == tg_id, Candidate.position == "sales")
-        )
-        return r.scalar_one_or_none()
+        r = await s.execute(select(Candidate).where(Candidate.telegram_id == tg_id))
+        c = r.scalar_one_or_none()
+        if c is None:
+            return None
+        pos = getattr(c, "position", None)
+        # position=sales явно, или NULL но уже на этапах воронки продажника (10+)
+        if pos == "sales" or (pos is None and c.stage >= 10):
+            return c
+        return None
 
 
 async def notify_hr(bot: Bot, text: str):
@@ -651,10 +656,14 @@ async def handle_sales_text(message: Message, bot: Bot):
             async with get_session() as s:
                 r = await s.execute(select(Candidate).where(Candidate.id == c.id))
                 cand = r.scalar_one()
-                cand.awaiting = "internship_d2_consp"
+                cand.awaiting = "internship_d2_errors"
                 cand.last_activity_at = datetime.utcnow()
-            await message.answer(INTERNSHIP_DAYS[2]["task_done_msg"])
-            await message.answer(INTERNSHIP_DAYS[2]["consp_task"], reply_markup=kb_consp_done())
+            await message.answer(
+                "✅ Голосовое получено! Передано руководителю.\n\n"
+                "Теперь напиши текстом:\n"
+                "<b>Какие ошибки совершил менеджер в плохих звонках?</b>\n\n"
+                "<i>Разбери каждый из 3 примеров по 1–2 ошибки.</i>"
+            )
             return True
         else:
             await message.answer(
@@ -662,6 +671,31 @@ async def handle_sales_text(message: Message, bot: Bot):
                 "Нажми на 🎤 микрофон в Telegram и запиши презентацию компании."
             )
             return True
+
+    # Анализ ошибок плохих звонков — День 2
+    if awaiting == "internship_d2_errors":
+        answer = message.text.strip() if message.text else ""
+        if len(answer) < 15:
+            await message.answer("Напиши развёрнуто — хотя бы 1–2 ошибки на каждый звонок.")
+            return True
+        # Сохраняем и пересылаем HR
+        async with get_session() as s:
+            r = await s.execute(select(Candidate).where(Candidate.id == c.id))
+            cand = r.scalar_one()
+            data = get_sales_data(cand)
+            if "internship" not in data:
+                data["internship"] = {}
+            data["internship"]["day2_errors"] = answer
+            cand.sales_data = json.dumps(data, ensure_ascii=False)
+            cand.awaiting = "internship_d2_consp"
+            cand.last_activity_at = datetime.utcnow()
+            full_name = cand.full_name
+            cid = cand.id
+        await notify_hr(bot,
+            f"📋 День 2 — анализ ошибок: <b>{full_name}</b> (#{cid})\n\n{answer[:600]}")
+        await message.answer(INTERNSHIP_DAYS[2]["task_done_msg"])
+        await message.answer(INTERNSHIP_DAYS[2]["consp_task"], reply_markup=kb_consp_done())
+        return True
 
     # Текстовые задания дней 1, 3, 4, 5
     day_awaiting_map = {
