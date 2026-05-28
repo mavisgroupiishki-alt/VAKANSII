@@ -75,19 +75,31 @@ async def update_candidate(cid: int, **kwargs):
 
 
 async def send_video_safe(bot: Bot, tg_id: int, path: str, caption: str, reply_markup=None):
-    """Безопасная отправка видео — если файл есть."""
-    p = Path(path)
-    if p.exists():
-        await bot.send_video(
-            tg_id,
-            FSInputFile(p),
-            caption=caption,
-            reply_markup=reply_markup,
-        )
+    """Безопасная отправка видео. Ищет файл по нескольким путям."""
+    import os
+    search_paths = [
+        Path(path),
+        Path("/app") / path,
+        Path(os.getcwd()) / path,
+        Path(__file__).parent.parent / path,
+    ]
+    video_path = next((p for p in search_paths if p.exists()), None)
+
+    if video_path:
+        try:
+            await bot.send_video(tg_id, FSInputFile(video_path),
+                                 caption=caption, reply_markup=reply_markup)
+            return
+        except Exception as e:
+            log.error(f"Ошибка отправки видео {video_path}: {e}")
+
+    # Видео не найдено — логируем и отправляем текст с кнопкой
+    log.warning(f"Видео не найдено: {path}. Искал в: {[str(p) for p in search_paths]}")
+    text = f"📹 <b>{caption}</b>\n\n⚠️ Видео временно недоступно."
+    if reply_markup:
+        await bot.send_message(tg_id, text, reply_markup=reply_markup)
     else:
-        log.warning(f"Видео не найдено: {path}")
-        if reply_markup:
-            await bot.send_message(tg_id, "⚠️ Видео временно недоступно.", reply_markup=reply_markup)
+        await bot.send_message(tg_id, text)
 
 
 # ══════════════════════════════════════════════════════════════
