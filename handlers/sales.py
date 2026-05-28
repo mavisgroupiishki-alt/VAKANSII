@@ -233,12 +233,13 @@ async def cb_sales_test_start(callback: CallbackQuery):
     c = await get_sales_candidate(callback.from_user.id)
     if not c:
         await callback.answer(); return
-    deadline = datetime.utcnow() + timedelta(minutes=30)
+    deadline = datetime.utcnow() + timedelta(hours=2)
     async with get_session() as s:
         await s.execute(delete(TestSession).where(
             TestSession.candidate_id == c.id, TestSession.test_number == 10))
         s.add(TestSession(candidate_id=c.id, test_number=10, deadline=deadline,
-                          current_question=0, answers_json="[]", selected_options="[]"))
+                          current_question=0, answers_json="[]", selected_options="[]",
+                          is_active=True))
         r = await s.execute(select(Candidate).where(Candidate.id == c.id))
         cand = r.scalar_one()
         cand.awaiting = "sales_test_active"
@@ -255,19 +256,24 @@ async def _send_video_test_q(message, q_idx, selected):
     is_multi = q["type"] == "multi"
     prefix = f"<b>Вопрос {q_idx+1}/{len(TEST_SALES_VIDEO)}</b>"
     if is_multi:
-        prefix += "\n<i>(выберите все верные)</i>"
-    await message.answer(f"{prefix}\n\n{q['text']}",
-                         reply_markup=kb_test_question(TEST_SALES_VIDEO, q_idx, selected))
+        prefix += "\n<i>(выберите все верные варианты, затем нажмите «Подтвердить»)</i>"
+    # Отправляем текст вопроса отдельно, клавиатуру — отдельно
+    # Это решает проблему с Telegram когда длинный текст + много кнопок не отображается
+    await message.answer(f"{prefix}\n\n{q['text']}")
+    await message.answer(
+        "👇 Выберите ответ:",
+        reply_markup=kb_test_question(TEST_SALES_VIDEO, q_idx, selected)
+    )
 
 
 @router.callback_query(F.data.startswith("stest_"))
 async def cb_video_test_answer(callback: CallbackQuery, bot: Bot):
+    await callback.answer()  # Сразу отвечаем Telegram чтобы не было повторов
     c = await get_sales_candidate(callback.from_user.id)
     if not c:
-        await callback.answer(); return
+        return
 
     parts = callback.data.split("_")
-    # stest_confirm_N или stest_N_I
     if parts[1] == "confirm":
         q_idx = int(parts[2])
         action = "confirm"
@@ -283,11 +289,11 @@ async def cb_video_test_answer(callback: CallbackQuery, bot: Bot):
             TestSession.is_active == True))
         ts = ts_r.scalar_one_or_none()
         if not ts:
-            await callback.answer("Сессия не найдена."); return
+            await callback.message.answer("⚠️ Сессия теста не найдена. Напишите рекрутеру.")
+            return
 
         if datetime.utcnow() > ts.deadline:
             ts.is_active = False
-            await callback.answer("⏰ Время вышло!")
             await callback.message.answer("⏰ Время на тест истекло. Свяжитесь с рекрутером.")
             return
 
@@ -301,7 +307,6 @@ async def cb_video_test_answer(callback: CallbackQuery, bot: Bot):
             ts.answers_json = json.dumps(answers)
             ts.selected_options = "[]"
             ts.current_question += 1
-            await callback.answer()
             try:
                 await callback.message.edit_reply_markup(reply_markup=None)
             except Exception:
@@ -314,24 +319,26 @@ async def cb_video_test_answer(callback: CallbackQuery, bot: Bot):
                 await _finish_video_test(cid, answers, callback.message, bot)
             else:
                 await _send_video_test_q(callback.message, ts.current_question, [])
-        else:
+
+        elif action == "pick":
             if is_multi:
                 if opt_idx in selected:
                     selected.remove(opt_idx)
                 else:
                     selected.append(opt_idx)
                 ts.selected_options = json.dumps(selected)
-                await callback.answer()
                 try:
                     await callback.message.edit_reply_markup(
                         reply_markup=kb_test_question(TEST_SALES_VIDEO, ts.current_question, selected))
                 except Exception:
-                    pass
+                    await callback.message.answer(
+                        "👇 Выберите ответ:",
+                        reply_markup=kb_test_question(TEST_SALES_VIDEO, ts.current_question, selected)
+                    )
             else:
                 answers.append([opt_idx])
                 ts.answers_json = json.dumps(answers)
                 ts.current_question += 1
-                await callback.answer()
                 try:
                     await callback.message.edit_reply_markup(reply_markup=None)
                 except Exception:
@@ -471,7 +478,8 @@ async def cb_itest_start(callback: CallbackQuery):
         await s.execute(delete(TestSession).where(
             TestSession.candidate_id == c.id, TestSession.test_number == test_num))
         s.add(TestSession(candidate_id=c.id, test_number=test_num, deadline=deadline,
-                          current_question=0, answers_json="[]", selected_options="[]"))
+                          current_question=0, answers_json="[]", selected_options="[]",
+                          is_active=True))
         r = await s.execute(select(Candidate).where(Candidate.id == c.id))
         cand = r.scalar_one()
         cand.awaiting = dd["awaiting_test"]
