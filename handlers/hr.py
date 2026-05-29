@@ -1,9 +1,10 @@
 """Хендлеры для рекрутера — админ-команды."""
 import csv
 import io
-import json
 import secrets
 import os
+import json
+import html
 from datetime import datetime
 
 from aiogram import Router, Bot, F
@@ -14,21 +15,20 @@ from aiogram.types import (
     Message, BufferedInputFile, CallbackQuery,
     InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove,
 )
-from sqlalchemy import select, func, delete, desc
+from sqlalchemy import select, func, delete
 
 from config import is_hr
 from db.database import get_session
 from db.models import Candidate, TestResult, TestSession
 from data.texts import CASES_TEMPLATE, HR_NEW_CANDIDATE_ADDED
 from data.sources import SOURCES, source_label
+from data.questions import get_questions
 from data.keyboards import (
     kb_main_menu, kb_more_menu,
     kb_candidates_filters, kb_candidate_list, kb_candidate_actions,
-    kb_status_choice, kb_confirm_retry,
+    kb_status_choice, kb_confirm_retry, kb_candidate_test_results, kb_back_to_candidate,
 )
 from data.keyboards import kb_confirm_delete as kb_confirm_delete_new
-from data.questions import get_questions
-from data.sales_flow import TEST_SALES_VIDEO, INTERNSHIP_DAYS
 
 router = Router()
 # Router-level filter — этот роутер работает только для HR.
@@ -68,6 +68,108 @@ def kb_sources() -> InlineKeyboardMarkup:
 
 # Используем kb_confirm_delete_new из data.keyboards для удаления
 kb_confirm_delete = kb_confirm_delete_new
+
+
+def _get_questions_for_test(test_number: int) -> list[dict]:
+    """Возвращает вопросы для обычных тестов и тестов воронки продажника."""
+    if test_number in (1, 2):
+        return get_questions(test_number)
+
+    # Импорт внутри функции, чтобы не тянуть sales_flow при старте обычной воронки.
+    from data.sales_flow import TEST_SALES_VIDEO, INTERNSHIP_DAYS
+
+    if test_number == 10:
+        return TEST_SALES_VIDEO
+
+    if 101 <= test_number <= 105:
+        day = test_number - 100
+        day_data = INTERNSHIP_DAYS.get(day)
+        if day_data and day_data.get("has_test"):
+            return day_data.get("test_questions", [])
+
+    return []
+
+
+def _format_options(question: dict, indexes: list[int]) -> str:
+    """Форматирует выбранные/правильные варианты ответа."""
+    if not indexes:
+        return "—"
+
+    options = question.get("options", [])
+    lines = []
+    for idx in indexes:
+        try:
+            idx_int = int(idx)
+        except Exception:
+            lines.append(f"• {html.escape(str(idx))}")
+            continue
+
+        if 0 <= idx_int < len(options):
+            lines.append(f"• {html.escape(str(options[idx_int]))}")
+        else:
+            lines.append(f"• вариант #{idx_int + 1}")
+
+    return "\n".join(lines) if lines else "—"
+
+
+def _split_long_text(text: str, limit: int = 3800) -> list[str]:
+    """Делит длинный HTML-текст на части, чтобы Telegram не отрезал сообщение."""
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    current = []
+    current_len = 0
+
+    for block in text.split("\n\n"):
+        block_len = len(block) + 2
+        if current and current_len + block_len > limit:
+            chunks.append("\n\n".join(current))
+            current = [block]
+            current_len = block_len
+        else:
+            current.append(block)
+            current_len += block_len
+
+    if current:
+        chunks.append("\n\n".join(current))
+
+    return chunks
+
+
+def _build_test_details_text(candidate: Candidate, result: TestResult, answers: list, questions: list[dict]) -> str:
+    """Собирает расшифровку ответов кандидата по тесту."""
+    mark = "✅" if result.passed else "❌"
+    text = (
+        f"<b>🧪 Ответы на тест кандидата</b>\n\n"
+        f"👤 <b>{html.escape(candidate.full_name)}</b> (#{candidate.id})\n"
+        f"{mark} Тест <b>{result.test_number}</b>: <b>{result.score_percent}%</b>\n"
+        f"Дата прохождения: {result.completed_at.strftime('%d.%m.%Y %H:%M')}\n\n"
+    )
+
+    if not questions:
+        return text + "⚠️ Для этого номера теста не найдены вопросы в коде."
+
+    if not answers:
+        text += (
+            "⚠️ Подробные ответы не найдены. Такое может быть по старым прохождениям, "
+            "если сессия теста была удалена или тест открывали на пересдачу."
+        )
+        return text
+
+    for i, question in enumerate(questions):
+        candidate_answer = answers[i] if i < len(answers) else []
+        correct_answer = question.get("correct", [])
+        is_correct = sorted(candidate_answer) == sorted(correct_answer)
+        q_mark = "✅" if is_correct else "❌"
+
+        text += (
+            f"{q_mark} <b>{i + 1}. {html.escape(str(question.get('text', 'Вопрос')))}</b>\n"
+            f"<b>Ответ кандидата:</b>\n{_format_options(question, candidate_answer)}\n"
+            f"<b>Правильный ответ:</b>\n{_format_options(question, correct_answer)}\n\n"
+        )
+
+    return text.strip()
 
 
 # ============================================================
@@ -336,159 +438,6 @@ def _format_candidate_short(c: Candidate) -> str:
         f"  Этап: {stage_names.get(c.stage, '?')} | Статус: {c.status}\n"
     )
 
-# ============================================================
-# ДЕТАЛИЗАЦИЯ ТЕСТОВ: что кандидат выбрал и где ошибся
-# ============================================================
-def _test_title(test_number: int) -> str:
-    titles = {
-        1: "Тест 1: о компании",
-        2: "Тест 2: о продуктах",
-        10: "Тест по видео для менеджера по продажам",
-        101: "Стажировка, день 1: компания и продукты",
-        102: "Стажировка, день 2: продажи и скрипт",
-        103: "Стажировка, день 3: возражения и продукт",
-    }
-    return titles.get(test_number, f"Тест {test_number}")
-
-
-def _questions_for_test(test_number: int) -> list[dict]:
-    if test_number in (1, 2):
-        return get_questions(test_number)
-    if test_number == 10:
-        return TEST_SALES_VIDEO
-    if 101 <= test_number <= 105:
-        day = test_number - 100
-        day_data = INTERNSHIP_DAYS.get(day, {})
-        return day_data.get("test_questions", []) or []
-    return []
-
-
-def _answer_text(question: dict, indexes: list[int] | None) -> str:
-    if not indexes:
-        return "—"
-    options = question.get("options", [])
-    labels = []
-    for idx in indexes:
-        if isinstance(idx, int) and 0 <= idx < len(options):
-            labels.append(options[idx])
-        else:
-            labels.append(str(idx))
-    return "; ".join(labels) if labels else "—"
-
-
-def _build_test_details_text(candidate: Candidate, result: TestResult | None, session: TestSession | None) -> str:
-    test_number = result.test_number if result else (session.test_number if session else 0)
-    questions = _questions_for_test(test_number)
-
-    text = (
-        f"🔎 <b>{_test_title(test_number)}</b>\n"
-        f"Кандидат: <b>{candidate.full_name}</b> (#{candidate.id})\n"
-    )
-    if result:
-        mark = "✅" if result.passed else "❌"
-        text += f"Итог: {mark} <b>{result.score_percent}%</b>\n"
-        text += f"Завершён: {result.completed_at.strftime('%d.%m.%Y %H:%M')}\n"
-
-    if not questions:
-        return text + "\n⚠️ Не нашёл список вопросов для этого теста."
-
-    if not session or not session.answers_json:
-        return (
-            text
-            + "\n⚠️ Детализация ответов не найдена. Возможно, это старый результат, "
-            + "результат был удалён при пересдаче или тест начат до добавления просмотра ошибок."
-        )
-
-    try:
-        answers = json.loads(session.answers_json)
-    except Exception:
-        answers = []
-
-    wrong_count = 0
-    text += "\n<b>Разбор по вопросам:</b>\n"
-    for i, q in enumerate(questions):
-        given = sorted(answers[i]) if i < len(answers) and isinstance(answers[i], list) else []
-        correct = sorted(q.get("correct", []))
-        ok = given == correct
-        if not ok:
-            wrong_count += 1
-        text += (
-            f"\n{('✅' if ok else '❌')} <b>{i + 1}. {q.get('text', '')}</b>\n"
-            f"Ответ кандидата: <i>{_answer_text(q, given)}</i>\n"
-            f"Правильный ответ: <i>{_answer_text(q, correct)}</i>\n"
-        )
-
-    text += f"\n<b>Ошибок:</b> {wrong_count} из {len(questions)}"
-    return text
-
-
-async def _send_test_details(target: Message | CallbackQuery, cid: int, test_number: int):
-    async with get_session() as s:
-        r_c = await s.execute(select(Candidate).where(Candidate.id == cid))
-        c = r_c.scalar_one_or_none()
-        if not c:
-            text = "Кандидат не найден."
-            if isinstance(target, CallbackQuery):
-                await target.answer(text, show_alert=True)
-            else:
-                await target.answer(text)
-            return
-
-        r_result = await s.execute(
-            select(TestResult)
-            .where(TestResult.candidate_id == cid, TestResult.test_number == test_number)
-            .order_by(desc(TestResult.completed_at))
-        )
-        result = r_result.scalar_one_or_none()
-
-        r_session = await s.execute(
-            select(TestSession)
-            .where(TestSession.candidate_id == cid, TestSession.test_number == test_number)
-            .order_by(desc(TestSession.started_at))
-        )
-        session = r_session.scalar_one_or_none()
-
-    if not result and not session:
-        text = f"У кандидата #{cid} нет результата по тесту {test_number}."
-    else:
-        text = _build_test_details_text(c, result, session)
-
-    # Разбиваем длинный разбор на несколько сообщений.
-    chunks = [text[i:i + 3600] for i in range(0, len(text), 3600)]
-    if isinstance(target, CallbackQuery):
-        await target.answer()
-        for chunk in chunks:
-            await target.message.answer(chunk)
-    else:
-        for chunk in chunks:
-            await target.answer(chunk)
-
-
-@router.message(Command("test_details"))
-async def cmd_test_details(message: Message):
-    if not is_hr(message.from_user.id):
-        return
-    parts = message.text.split()
-    if len(parts) < 3:
-        await message.answer("Использование: /test_details &lt;ID&gt; &lt;номер_теста&gt;")
-        return
-    try:
-        cid = int(parts[1])
-        test_number = int(parts[2])
-    except ValueError:
-        await message.answer("ID и номер теста должны быть числами.")
-        return
-    await _send_test_details(message, cid, test_number)
-
-
-@router.callback_query(F.data.startswith("td_"))
-async def cb_test_details(callback: CallbackQuery):
-    parts = callback.data.split("_")
-    if len(parts) != 3:
-        await callback.answer("Некорректная кнопка.", show_alert=True)
-        return
-    await _send_test_details(callback, int(parts[1]), int(parts[2]))
-
 
 @router.message(Command("list"))
 async def cmd_list(message: Message):
@@ -578,7 +527,7 @@ async def cmd_candidate(message: Message):
         text += "<b>Результаты тестов:</b>\n"
         for r in results:
             mark = "✅" if r.passed else "❌"
-            text += f"  {mark} Тест {r.test_number}: <b>{r.score_percent}%</b> — /test_details {cid} {r.test_number}\n"
+            text += f"  {mark} Тест {r.test_number}: <b>{r.score_percent}%</b>\n"
     else:
         text += "<i>Тесты ещё не пройдены</i>\n"
 
@@ -589,7 +538,17 @@ async def cmd_candidate(message: Message):
         from data.slots import slot_label
         text += f"\n\n<b>📅 Слот собеседования:</b> {slot_label(c.interview_slot)}"
 
-    await message.answer(text)
+    has_test_1 = any(r.test_number == 1 for r in results)
+    has_test_2 = any(r.test_number == 2 for r in results)
+    has_telegram = c.telegram_id is not None
+
+    await message.answer(
+        text,
+        reply_markup=kb_candidate_actions(
+            cid, has_telegram, c.stage, c.status, has_test_1, has_test_2,
+            test_numbers=[r.test_number for r in results],
+        ),
+    )
 
 
 # ============================================================
@@ -1539,13 +1498,12 @@ async def show_candidate_card(callback: CallbackQuery):
 
     has_test_1 = any(r.test_number == 1 for r in results)
     has_test_2 = any(r.test_number == 2 for r in results)
-    test_numbers = [r.test_number for r in results]
 
     if results:
         text += "<b>Результаты тестов:</b>\n"
         for r in results:
             mark = "✅" if r.passed else "❌"
-            text += f"  {mark} Тест {r.test_number}: <b>{r.score_percent}%</b> — /test_details {cid} {r.test_number}\n"
+            text += f"  {mark} Тест {r.test_number}: <b>{r.score_percent}%</b>\n"
     else:
         text += "<i>Тесты ещё не пройдены</i>\n"
 
@@ -1563,14 +1521,16 @@ async def show_candidate_card(callback: CallbackQuery):
         await callback.message.edit_text(
             text,
             reply_markup=kb_candidate_actions(
-                cid, has_telegram, c.stage, c.status, has_test_1, has_test_2, test_numbers
+                cid, has_telegram, c.stage, c.status, has_test_1, has_test_2,
+                test_numbers=[r.test_number for r in results],
             ),
         )
     except Exception:
         await callback.message.answer(
             text,
             reply_markup=kb_candidate_actions(
-                cid, has_telegram, c.stage, c.status, has_test_1, has_test_2, test_numbers
+                cid, has_telegram, c.stage, c.status, has_test_1, has_test_2,
+                test_numbers=[r.test_number for r in results],
             ),
         )
 
@@ -1578,6 +1538,118 @@ async def show_candidate_card(callback: CallbackQuery):
 # ============================================================
 # ДЕЙСТВИЯ В КАРТОЧКЕ КАНДИДАТА
 # ============================================================
+@router.callback_query(F.data.startswith("ca_tests_"))
+async def card_show_tests_menu(callback: CallbackQuery):
+    """Показать список тестов кандидата для просмотра ответов."""
+    cid = int(callback.data[len("ca_tests_"):])
+
+    async with get_session() as s:
+        c_result = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = c_result.scalar_one_or_none()
+        if not c:
+            await callback.answer("Кандидат не найден.", show_alert=True)
+            return
+
+        tr_result = await s.execute(
+            select(TestResult)
+            .where(TestResult.candidate_id == cid)
+            .order_by(TestResult.test_number)
+        )
+        results = tr_result.scalars().all()
+
+    if not results:
+        await callback.answer("У кандидата пока нет завершённых тестов.", show_alert=True)
+        return
+
+    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            f"🧪 <b>Ответы на тесты кандидата</b>\n\n"
+            f"👤 <b>{html.escape(c.full_name)}</b> (#{cid})\n\n"
+            f"Выберите тест, который нужно проверить:",
+            reply_markup=kb_candidate_test_results(cid, results),
+        )
+    except Exception:
+        await callback.message.answer(
+            f"🧪 <b>Ответы на тесты кандидата</b>\n\n"
+            f"👤 <b>{html.escape(c.full_name)}</b> (#{cid})\n\n"
+            f"Выберите тест, который нужно проверить:",
+            reply_markup=kb_candidate_test_results(cid, results),
+        )
+
+
+@router.callback_query(F.data.startswith("ca_test_"))
+async def card_show_test_details(callback: CallbackQuery):
+    """Показать подробные ответы кандидата по выбранному тесту."""
+    parts = callback.data[len("ca_test_"):].split("_")
+    if len(parts) != 2:
+        await callback.answer("Некорректная кнопка.", show_alert=True)
+        return
+
+    cid = int(parts[0])
+    test_num = int(parts[1])
+
+    async with get_session() as s:
+        c_result = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = c_result.scalar_one_or_none()
+        if not c:
+            await callback.answer("Кандидат не найден.", show_alert=True)
+            return
+
+        tr_result = await s.execute(
+            select(TestResult).where(
+                TestResult.candidate_id == cid,
+                TestResult.test_number == test_num,
+            )
+        )
+        result = tr_result.scalar_one_or_none()
+        if not result:
+            await callback.answer("Результат теста не найден.", show_alert=True)
+            return
+
+        ts_result = await s.execute(
+            select(TestSession)
+            .where(
+                TestSession.candidate_id == cid,
+                TestSession.test_number == test_num,
+            )
+            .order_by(TestSession.started_at.desc())
+        )
+        session = ts_result.scalars().first()
+
+        answers = []
+        if session and session.answers_json:
+            try:
+                answers = json.loads(session.answers_json)
+            except Exception:
+                answers = []
+
+    questions = _get_questions_for_test(test_num)
+    text = _build_test_details_text(c, result, answers, questions)
+    chunks = _split_long_text(text)
+
+    await callback.answer()
+
+    # Если текст помещается в одно сообщение, заменяем текущее сообщение.
+    # Если длинный — первое сообщение редактируем, остальные отправляем следом.
+    try:
+        await callback.message.edit_text(
+            chunks[0],
+            reply_markup=kb_back_to_candidate(cid) if len(chunks) == 1 else None,
+        )
+    except Exception:
+        await callback.message.answer(
+            chunks[0],
+            reply_markup=kb_back_to_candidate(cid) if len(chunks) == 1 else None,
+        )
+
+    for chunk in chunks[1:-1]:
+        await callback.message.answer(chunk)
+
+    if len(chunks) > 1:
+        await callback.message.answer(chunks[-1], reply_markup=kb_back_to_candidate(cid))
+
+
 @router.callback_query(F.data.startswith("ca_invite_"))
 async def card_show_invite(callback: CallbackQuery, bot: Bot):
     """Показать ссылку-приглашение."""
