@@ -107,7 +107,15 @@ def kb_candidate_list(candidates: list, filter_key: str, page: int = 0, per_page
 # ============================================================
 # КАРТОЧКА КАНДИДАТА — ДЕЙСТВИЯ
 # ============================================================
-def kb_candidate_actions(candidate_id: int, has_telegram: bool, stage: int, status: str, has_test_1: bool, has_test_2: bool) -> InlineKeyboardMarkup:
+def kb_candidate_actions(
+    candidate_id: int,
+    has_telegram: bool,
+    stage: int,
+    status: str,
+    has_test_1: bool,
+    has_test_2: bool,
+    test_numbers: list[int] | None = None,
+) -> InlineKeyboardMarkup:
     """Кнопки действий в карточке кандидата."""
     rows = []
 
@@ -128,6 +136,16 @@ def kb_candidate_actions(candidate_id: int, has_telegram: bool, stage: int, stat
         rows.append([
             InlineKeyboardButton(text="📋 Получить кейсы", callback_data=f"ca_cases_{candidate_id}"),
         ])
+
+    # Детализация тестов: какие вопросы были верные/неверные
+    if test_numbers:
+        for test_num in test_numbers:
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"🔎 Ошибки по тесту {test_num}",
+                    callback_data=f"td_{candidate_id}_{test_num}",
+                )
+            ])
 
     # Изменение статуса
     rows.append([
