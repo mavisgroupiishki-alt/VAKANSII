@@ -1,6 +1,7 @@
 """Хендлеры для рекрутера — админ-команды."""
 import csv
 import io
+import json
 import secrets
 import os
 from datetime import datetime
@@ -13,7 +14,7 @@ from aiogram.types import (
     Message, BufferedInputFile, CallbackQuery,
     InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove,
 )
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func, delete, desc
 
 from config import is_hr
 from db.database import get_session
@@ -26,6 +27,8 @@ from data.keyboards import (
     kb_status_choice, kb_confirm_retry,
 )
 from data.keyboards import kb_confirm_delete as kb_confirm_delete_new
+from data.questions import get_questions
+from data.sales_flow import TEST_SALES_VIDEO, INTERNSHIP_DAYS
 
 router = Router()
 # Router-level filter — этот роутер работает только для HR.
@@ -333,6 +336,159 @@ def _format_candidate_short(c: Candidate) -> str:
         f"  Этап: {stage_names.get(c.stage, '?')} | Статус: {c.status}\n"
     )
 
+# ============================================================
+# ДЕТАЛИЗАЦИЯ ТЕСТОВ: что кандидат выбрал и где ошибся
+# ============================================================
+def _test_title(test_number: int) -> str:
+    titles = {
+        1: "Тест 1: о компании",
+        2: "Тест 2: о продуктах",
+        10: "Тест по видео для менеджера по продажам",
+        101: "Стажировка, день 1: компания и продукты",
+        102: "Стажировка, день 2: продажи и скрипт",
+        103: "Стажировка, день 3: возражения и продукт",
+    }
+    return titles.get(test_number, f"Тест {test_number}")
+
+
+def _questions_for_test(test_number: int) -> list[dict]:
+    if test_number in (1, 2):
+        return get_questions(test_number)
+    if test_number == 10:
+        return TEST_SALES_VIDEO
+    if 101 <= test_number <= 105:
+        day = test_number - 100
+        day_data = INTERNSHIP_DAYS.get(day, {})
+        return day_data.get("test_questions", []) or []
+    return []
+
+
+def _answer_text(question: dict, indexes: list[int] | None) -> str:
+    if not indexes:
+        return "—"
+    options = question.get("options", [])
+    labels = []
+    for idx in indexes:
+        if isinstance(idx, int) and 0 <= idx < len(options):
+            labels.append(options[idx])
+        else:
+            labels.append(str(idx))
+    return "; ".join(labels) if labels else "—"
+
+
+def _build_test_details_text(candidate: Candidate, result: TestResult | None, session: TestSession | None) -> str:
+    test_number = result.test_number if result else (session.test_number if session else 0)
+    questions = _questions_for_test(test_number)
+
+    text = (
+        f"🔎 <b>{_test_title(test_number)}</b>\n"
+        f"Кандидат: <b>{candidate.full_name}</b> (#{candidate.id})\n"
+    )
+    if result:
+        mark = "✅" if result.passed else "❌"
+        text += f"Итог: {mark} <b>{result.score_percent}%</b>\n"
+        text += f"Завершён: {result.completed_at.strftime('%d.%m.%Y %H:%M')}\n"
+
+    if not questions:
+        return text + "\n⚠️ Не нашёл список вопросов для этого теста."
+
+    if not session or not session.answers_json:
+        return (
+            text
+            + "\n⚠️ Детализация ответов не найдена. Возможно, это старый результат, "
+            + "результат был удалён при пересдаче или тест начат до добавления просмотра ошибок."
+        )
+
+    try:
+        answers = json.loads(session.answers_json)
+    except Exception:
+        answers = []
+
+    wrong_count = 0
+    text += "\n<b>Разбор по вопросам:</b>\n"
+    for i, q in enumerate(questions):
+        given = sorted(answers[i]) if i < len(answers) and isinstance(answers[i], list) else []
+        correct = sorted(q.get("correct", []))
+        ok = given == correct
+        if not ok:
+            wrong_count += 1
+        text += (
+            f"\n{('✅' if ok else '❌')} <b>{i + 1}. {q.get('text', '')}</b>\n"
+            f"Ответ кандидата: <i>{_answer_text(q, given)}</i>\n"
+            f"Правильный ответ: <i>{_answer_text(q, correct)}</i>\n"
+        )
+
+    text += f"\n<b>Ошибок:</b> {wrong_count} из {len(questions)}"
+    return text
+
+
+async def _send_test_details(target: Message | CallbackQuery, cid: int, test_number: int):
+    async with get_session() as s:
+        r_c = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = r_c.scalar_one_or_none()
+        if not c:
+            text = "Кандидат не найден."
+            if isinstance(target, CallbackQuery):
+                await target.answer(text, show_alert=True)
+            else:
+                await target.answer(text)
+            return
+
+        r_result = await s.execute(
+            select(TestResult)
+            .where(TestResult.candidate_id == cid, TestResult.test_number == test_number)
+            .order_by(desc(TestResult.completed_at))
+        )
+        result = r_result.scalar_one_or_none()
+
+        r_session = await s.execute(
+            select(TestSession)
+            .where(TestSession.candidate_id == cid, TestSession.test_number == test_number)
+            .order_by(desc(TestSession.started_at))
+        )
+        session = r_session.scalar_one_or_none()
+
+    if not result and not session:
+        text = f"У кандидата #{cid} нет результата по тесту {test_number}."
+    else:
+        text = _build_test_details_text(c, result, session)
+
+    # Разбиваем длинный разбор на несколько сообщений.
+    chunks = [text[i:i + 3600] for i in range(0, len(text), 3600)]
+    if isinstance(target, CallbackQuery):
+        await target.answer()
+        for chunk in chunks:
+            await target.message.answer(chunk)
+    else:
+        for chunk in chunks:
+            await target.answer(chunk)
+
+
+@router.message(Command("test_details"))
+async def cmd_test_details(message: Message):
+    if not is_hr(message.from_user.id):
+        return
+    parts = message.text.split()
+    if len(parts) < 3:
+        await message.answer("Использование: /test_details &lt;ID&gt; &lt;номер_теста&gt;")
+        return
+    try:
+        cid = int(parts[1])
+        test_number = int(parts[2])
+    except ValueError:
+        await message.answer("ID и номер теста должны быть числами.")
+        return
+    await _send_test_details(message, cid, test_number)
+
+
+@router.callback_query(F.data.startswith("td_"))
+async def cb_test_details(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    if len(parts) != 3:
+        await callback.answer("Некорректная кнопка.", show_alert=True)
+        return
+    await _send_test_details(callback, int(parts[1]), int(parts[2]))
+
 
 @router.message(Command("list"))
 async def cmd_list(message: Message):
@@ -422,7 +578,7 @@ async def cmd_candidate(message: Message):
         text += "<b>Результаты тестов:</b>\n"
         for r in results:
             mark = "✅" if r.passed else "❌"
-            text += f"  {mark} Тест {r.test_number}: <b>{r.score_percent}%</b>\n"
+            text += f"  {mark} Тест {r.test_number}: <b>{r.score_percent}%</b> — /test_details {cid} {r.test_number}\n"
     else:
         text += "<i>Тесты ещё не пройдены</i>\n"
 
@@ -1383,12 +1539,13 @@ async def show_candidate_card(callback: CallbackQuery):
 
     has_test_1 = any(r.test_number == 1 for r in results)
     has_test_2 = any(r.test_number == 2 for r in results)
+    test_numbers = [r.test_number for r in results]
 
     if results:
         text += "<b>Результаты тестов:</b>\n"
         for r in results:
             mark = "✅" if r.passed else "❌"
-            text += f"  {mark} Тест {r.test_number}: <b>{r.score_percent}%</b>\n"
+            text += f"  {mark} Тест {r.test_number}: <b>{r.score_percent}%</b> — /test_details {cid} {r.test_number}\n"
     else:
         text += "<i>Тесты ещё не пройдены</i>\n"
 
@@ -1406,14 +1563,14 @@ async def show_candidate_card(callback: CallbackQuery):
         await callback.message.edit_text(
             text,
             reply_markup=kb_candidate_actions(
-                cid, has_telegram, c.stage, c.status, has_test_1, has_test_2
+                cid, has_telegram, c.stage, c.status, has_test_1, has_test_2, test_numbers
             ),
         )
     except Exception:
         await callback.message.answer(
             text,
             reply_markup=kb_candidate_actions(
-                cid, has_telegram, c.stage, c.status, has_test_1, has_test_2
+                cid, has_telegram, c.stage, c.status, has_test_1, has_test_2, test_numbers
             ),
         )
 
