@@ -1,5 +1,6 @@
 """Сервис напоминаний — проверяет кандидатов каждый час."""
 from datetime import datetime, timedelta, time
+from zoneinfo import ZoneInfo
 import logging
 
 from aiogram import Bot
@@ -192,7 +193,7 @@ async def check_and_send_reminders(bot: Bot) -> None:
 
 def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     """Запустить планировщик с проверкой каждый час."""
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(timezone=ZoneInfo("Europe/Minsk"))
     scheduler.add_job(
         check_and_send_reminders,
         trigger="interval",
@@ -211,13 +212,13 @@ def setup_scheduler(bot: Bot) -> AsyncIOScheduler:
     scheduler.start()
     log.info(f"Планировщик запущен, интервал = {REMINDER_INTERVAL_HOURS}ч")
 
-    # Напоминания стажёрам — каждое утро в 9:00
-    from handlers.sales import remind_internship_next_day
+    # Автоотправка стажировочных дней менеджерам по продажам — каждый день в 08:30 по Минску.
+    from handlers.sales import send_scheduled_internship_days
     scheduler.add_job(
-        remind_internship_next_day,
+        send_scheduled_internship_days,
         trigger="cron",
-        hour=9,
-        minute=0,
+        hour=8,
+        minute=30,
         args=[bot],
     )
 
