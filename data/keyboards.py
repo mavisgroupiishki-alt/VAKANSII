@@ -14,18 +14,21 @@ def kb_main_menu() -> ReplyKeyboardMarkup:
         keyboard=[
             [
                 KeyboardButton(text="➕ Добавить кандидата"),
+                KeyboardButton(text="🚀 Добавить сразу на стажировку"),
+            ],
+            [
                 KeyboardButton(text="📋 Кандидаты"),
-            ],
-            [
                 KeyboardButton(text="🔍 Поиск"),
+            ],
+            [
                 KeyboardButton(text="📅 Расписание"),
-            ],
-            [
                 KeyboardButton(text="📊 Аналитика"),
-                KeyboardButton(text="📈 Статистика"),
             ],
             [
+                KeyboardButton(text="📈 Статистика"),
                 KeyboardButton(text="📥 Экспорт CSV"),
+            ],
+            [
                 KeyboardButton(text="⚙️ Ещё"),
             ],
         ],
@@ -244,6 +247,15 @@ def kb_internship_start_dates(candidate_id: int, dates: list[tuple[str, str]]) -
         )])
     rows.append([InlineKeyboardButton(text="↩️ Назад в карточку", callback_data=f"cd_{candidate_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_direct_internship_day_choice() -> InlineKeyboardMarkup:
+    """Выбор дня, с которого кандидат начнёт стажировку при добавлении сразу на стажировку."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="День 1 стажировки", callback_data="direct_day_1")],
+        [InlineKeyboardButton(text="День 2 стажировки", callback_data="direct_day_2")],
+        [InlineKeyboardButton(text="День 3 стажировки", callback_data="direct_day_3")],
+    ])
 
 
 def kb_status_choice(candidate_id: int) -> InlineKeyboardMarkup:
