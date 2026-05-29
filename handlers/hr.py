@@ -1715,6 +1715,69 @@ async def card_set_internship_date(callback: CallbackQuery, bot: Bot):
         await callback.message.answer(text, reply_markup=kb_back_to_candidate(cid))
 
 
+@router.callback_query(F.data.startswith("ca_send_internship_day_"))
+async def card_send_internship_day_now(callback: CallbackQuery, bot: Bot):
+    """HR вручную отправляет кандидату День 1/2/3 стажировки прямо сейчас."""
+    payload = callback.data[len("ca_send_internship_day_"):]
+    try:
+        cid_str, day_str = payload.rsplit("_", 1)
+        cid = int(cid_str)
+        day = int(day_str)
+    except Exception:
+        await callback.answer("Не удалось распознать день стажировки.", show_alert=True)
+        return
+
+    if day not in (1, 2, 3):
+        await callback.answer("Можно отправить только День 1, День 2 или День 3.", show_alert=True)
+        return
+
+    async with get_session() as s:
+        result = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = result.scalar_one_or_none()
+        if not c:
+            await callback.answer("Кандидат не найден.", show_alert=True)
+            return
+        if not c.telegram_id:
+            await callback.answer("Кандидат ещё не активировал бот.", show_alert=True)
+            return
+        if c.status == "rejected":
+            await callback.answer("Кандидат в отказе. Сначала измените статус.", show_alert=True)
+            return
+
+        # Для старых карточек фиксируем позицию как sales, чтобы дальше работал планировщик.
+        if getattr(c, "position", None) != "sales":
+            c.position = "sales"
+        c.stage = 15 if c.stage < 15 else c.stage
+        c.status = "active"
+        full_name = c.full_name
+
+    from handlers.sales import send_internship_day
+
+    async with get_session() as s:
+        result = await s.execute(select(Candidate).where(Candidate.id == cid))
+        candidate = result.scalar_one()
+
+    try:
+        await send_internship_day(candidate, day, bot)
+    except Exception as e:
+        await callback.answer("Не удалось отправить день стажировки.", show_alert=True)
+        try:
+            await callback.message.answer(f"⚠️ Ошибка отправки Дня {day}: <code>{html.escape(str(e))}</code>")
+        except Exception:
+            pass
+        return
+
+    await callback.answer(f"День {day} отправлен кандидату.")
+    text = (
+        f"📤 <b>День {day} стажировки отправлен прямо сейчас</b>\n\n"
+        f"👤 Кандидат: <b>{html.escape(full_name)}</b> (#{cid})"
+    )
+    try:
+        await callback.message.answer(text, reply_markup=kb_back_to_candidate(cid))
+    except Exception:
+        pass
+
+
 @router.callback_query(F.data.startswith("ca_test_"))
 async def card_show_test_details(callback: CallbackQuery):
     """Показать подробные ответы кандидата по выбранному тесту."""
