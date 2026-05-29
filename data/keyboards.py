@@ -161,6 +161,18 @@ def kb_candidate_actions(
                 ),
             ])
 
+        # Ручная отправка стажировочного дня прямо сейчас.
+        # Нужна, если РОП хочет дать кандидату материал вне расписания 08:30.
+        rows.append([
+            InlineKeyboardButton(text="📤 День 1 сейчас", callback_data=f"ca_send_internship_day_{candidate_id}_1"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="📤 День 2 сейчас", callback_data=f"ca_send_internship_day_{candidate_id}_2"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="📤 День 3 сейчас", callback_data=f"ca_send_internship_day_{candidate_id}_3"),
+        ])
+
     # Кейсы — только если прошёл оба теста
     if has_test_1 and has_test_2 and status == "passed":
         rows.append([
