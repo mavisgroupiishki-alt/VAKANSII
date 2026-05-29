@@ -24,6 +24,7 @@ from data.sales_flow import (
     INTERNSHIP_WELCOME, INTERNSHIP_DAYS, INTERNSHIP_DAY_REMINDER,
 )
 from data.videos import VIDEO_1_PATH, VIDEO_2_PATH, SALES_VIDEO_1_URL, SALES_VIDEO_2_URL
+from data.calls import GOOD_CALLS_URL, BAD_CALLS_URL
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -526,7 +527,8 @@ async def send_internship_day(candidate: Candidate, day: int, bot: Bot):
         tg_id = c.telegram_id
 
     if tg_id:
-        await bot.send_message(tg_id, dd["materials"])
+        materials_markup = kb_calls_library() if day == 2 else None
+        await bot.send_message(tg_id, dd["materials"], reply_markup=materials_markup)
         await bot.send_message(tg_id, dd["task"])
 
 
