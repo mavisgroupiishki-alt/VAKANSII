@@ -23,7 +23,7 @@ from data.sales_flow import (
     SALES_TEST_PASSED, SALES_TEST_FAILED, HR_SALES_TEST_DONE,
     INTERNSHIP_WELCOME, INTERNSHIP_DAYS, INTERNSHIP_DAY_REMINDER,
 )
-from data.videos import VIDEO_1_PATH, VIDEO_2_PATH
+from data.videos import VIDEO_1_PATH, VIDEO_2_PATH, SALES_VIDEO_1_URL, SALES_VIDEO_2_URL
 
 log = logging.getLogger(__name__)
 router = Router()
@@ -75,8 +75,26 @@ async def update_candidate(cid: int, **kwargs):
             setattr(c, k, v)
 
 
-async def send_video_safe(bot: Bot, tg_id: int, path: str, caption: str, reply_markup=None):
-    """Безопасная отправка видео. Ищет файл по нескольким путям."""
+def _with_video_url_button(video_url: str, reply_markup=None) -> InlineKeyboardMarkup:
+    """Добавляет кнопку-ссылку на видео над существующими кнопками."""
+    rows = [[InlineKeyboardButton(text="▶️ Смотреть видео", url=video_url)]]
+    if reply_markup:
+        rows.extend(reply_markup.inline_keyboard)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def send_video_safe(bot: Bot, tg_id: int, path: str, caption: str, reply_markup=None, video_url: str = ""):
+    """Отправляет ссылку на видео, если она задана. Иначе пробует отправить локальный файл."""
+    if video_url:
+        await bot.send_message(
+            tg_id,
+            f"<b>{caption}</b>\n\n"
+            "Нажмите «▶️ Смотреть видео». После просмотра вернитесь в бот "
+            "и нажмите кнопку продолжения ниже.",
+            reply_markup=_with_video_url_button(video_url, reply_markup),
+        )
+        return
+
     import os
     search_paths = [
         Path(path),
@@ -262,10 +280,10 @@ async def _finish_anketa(bot: Bot, cid: int, tg_id: int):
                            last_activity_at=datetime.utcnow())
     await bot.send_message(tg_id, ANKETA_DONE)
     # Видео 1 — о компании
-    await send_video_safe(bot, tg_id, VIDEO_1_PATH, SALES_VIDEO_1_CAPTION)
+    await send_video_safe(bot, tg_id, VIDEO_1_PATH, SALES_VIDEO_1_CAPTION, video_url=SALES_VIDEO_1_URL)
     # Видео 2 — о продуктах (с кнопкой)
     await send_video_safe(bot, tg_id, VIDEO_2_PATH, SALES_VIDEO_2_CAPTION,
-                          reply_markup=kb_video_watched())
+                          reply_markup=kb_video_watched(), video_url=SALES_VIDEO_2_URL)
 
 
 # ══════════════════════════════════════════════════════════════

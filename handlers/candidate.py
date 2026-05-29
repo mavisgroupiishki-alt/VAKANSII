@@ -28,7 +28,7 @@ from data.texts import (
     HR_STARTED, HR_TEST_PASSED, HR_TEST_FAILED, HR_INTERVIEW_PASSED,
     HR_MOTIVATION_ANSWER, HR_SLOT_CHOSEN, HR_SLOT_NO_MATCH,
 )
-from data.videos import VIDEO_1_PATH, VIDEO_2_PATH
+from data.videos import VIDEO_1_PATH, VIDEO_2_PATH, VIDEO_1_URL, VIDEO_2_URL
 
 router = Router()
 
@@ -42,10 +42,12 @@ def kb_start_journey() -> InlineKeyboardMarkup:
     ]])
 
 
-def kb_watched_video_1() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Я посмотрел, готов к тесту", callback_data="ready_test_1")
-    ]])
+def kb_watched_video_1(video_url: str = "") -> InlineKeyboardMarkup:
+    rows = []
+    if video_url:
+        rows.append([InlineKeyboardButton(text="▶️ Смотреть видео", url=video_url)])
+    rows.append([InlineKeyboardButton(text="✅ Я посмотрел, готов к тесту", callback_data="ready_test_1")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_start_test(test_num: int) -> InlineKeyboardMarkup:
@@ -54,10 +56,12 @@ def kb_start_test(test_num: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def kb_watched_video_2() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Я изучил, готов к тесту", callback_data="ready_test_2")
-    ]])
+def kb_watched_video_2(video_url: str = "") -> InlineKeyboardMarkup:
+    rows = []
+    if video_url:
+        rows.append([InlineKeyboardButton(text="▶️ Смотреть видео", url=video_url)])
+    rows.append([InlineKeyboardButton(text="✅ Я изучил, готов к тесту", callback_data="ready_test_2")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_interview_slots() -> InlineKeyboardMarkup:
@@ -247,19 +251,28 @@ async def start_stage_1(callback: CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=None)
     await callback.message.answer(STAGE_1_INTRO)
 
-    # Отправляем видео
-    video_path = Path(VIDEO_1_PATH)
-    if video_path.exists():
-        await callback.message.answer_video(
-            video=FSInputFile(video_path),
-            caption="📹 Видео о Mavis Group",
-            reply_markup=kb_watched_video_1()
+    # Отправляем ссылку на видео, если она задана.
+    # Так видео не сжимается Telegram и его можно менять на Google Drive / Google Vids без правки кода.
+    if VIDEO_1_URL:
+        await callback.message.answer(
+            "📹 <b>Видео о Mavis Group</b>\n\n"
+            "Нажмите «▶️ Смотреть видео». После просмотра вернитесь в бот "
+            "и нажмите «✅ Я посмотрел, готов к тесту».",
+            reply_markup=kb_watched_video_1(VIDEO_1_URL),
         )
     else:
-        await callback.message.answer(
-            "⚠️ Видео временно недоступно. Уведомите рекрутера.",
-            reply_markup=kb_watched_video_1()
-        )
+        video_path = Path(VIDEO_1_PATH)
+        if video_path.exists():
+            await callback.message.answer_video(
+                video=FSInputFile(video_path),
+                caption="📹 Видео о Mavis Group",
+                reply_markup=kb_watched_video_1(),
+            )
+        else:
+            await callback.message.answer(
+                "⚠️ Видео временно недоступно. Уведомите рекрутера.",
+                reply_markup=kb_watched_video_1(),
+            )
 
     async with get_session() as s:
         result = await s.execute(select(Candidate).where(Candidate.id == candidate.id))
@@ -686,18 +699,26 @@ async def handle_text_messages(message: Message, bot: Bot):
 
         # Запускаем этап 2
         await message.answer(STAGE_2_INTRO)
-        video_2 = Path(VIDEO_2_PATH)
-        if video_2.exists():
-            await message.answer_video(
-                video=FSInputFile(video_2),
-                caption="📹 Видео о продуктах Mavis Group",
-                reply_markup=kb_watched_video_2(),
+        if VIDEO_2_URL:
+            await message.answer(
+                "📹 <b>Видео о продуктах Mavis Group</b>\n\n"
+                "Нажмите «▶️ Смотреть видео». После просмотра вернитесь в бот "
+                "и нажмите «✅ Я изучил, готов к тесту».",
+                reply_markup=kb_watched_video_2(VIDEO_2_URL),
             )
         else:
-            await message.answer(
-                "⚠️ Видео временно недоступно. Уведомите рекрутера.",
-                reply_markup=kb_watched_video_2(),
-            )
+            video_2 = Path(VIDEO_2_PATH)
+            if video_2.exists():
+                await message.answer_video(
+                    video=FSInputFile(video_2),
+                    caption="📹 Видео о продуктах Mavis Group",
+                    reply_markup=kb_watched_video_2(),
+                )
+            else:
+                await message.answer(
+                    "⚠️ Видео временно недоступно. Уведомите рекрутера.",
+                    reply_markup=kb_watched_video_2(),
+                )
         return
 
     # --- Коррекция контактов после «Время не подходит» ---
