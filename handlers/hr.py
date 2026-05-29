@@ -5,7 +5,8 @@ import secrets
 import os
 import json
 import html
-from datetime import datetime
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from aiogram import Router, Bot, F
 from aiogram.filters import Command
@@ -27,6 +28,7 @@ from data.keyboards import (
     kb_main_menu, kb_more_menu,
     kb_candidates_filters, kb_candidate_list, kb_candidate_actions,
     kb_status_choice, kb_confirm_retry, kb_candidate_test_results, kb_back_to_candidate,
+    kb_internship_start_dates,
 )
 from data.keyboards import kb_confirm_delete as kb_confirm_delete_new
 
@@ -430,8 +432,16 @@ async def cmd_invite(message: Message, bot: Bot):
 # ============================================================
 def _format_candidate_short(c: Candidate) -> str:
     stage_names = {
-        0: "не начал", 1: "видео 1 / тест 1", 2: "мотивация",
-        3: "видео 2 / тест 2", 4: "тесты пройдены", 5: "на кейсах", 6: "финал"
+        0: "не начал",
+        1: "видео 1 / тест 1", 2: "мотивация", 3: "видео 2 / тест 2",
+        4: "тесты пройдены", 5: "на кейсах", 6: "финал",
+        10: "анкета продажника",
+        11: "видео о компании",
+        12: "тест после видео",
+        13: "ждёт звонка РОП",
+        14: "после звонка / готов к стажировке",
+        15: "стажировка запланирована/идёт",
+        16: "бот-стажировка завершена",
     }
     return (
         f"#{c.id} <b>{c.full_name}</b>\n"
@@ -505,8 +515,16 @@ async def cmd_candidate(message: Message):
         results = tr_result.scalars().all()
 
     stage_names = {
-        0: "не начал", 1: "видео 1 / тест 1", 2: "мотивация",
-        3: "видео 2 / тест 2", 4: "тесты пройдены", 5: "на кейсах", 6: "финал"
+        0: "не начал",
+        1: "видео 1 / тест 1", 2: "мотивация", 3: "видео 2 / тест 2",
+        4: "тесты пройдены", 5: "на кейсах", 6: "финал",
+        10: "анкета продажника",
+        11: "видео о компании",
+        12: "тест после видео",
+        13: "ждёт звонка РОП",
+        14: "после звонка / готов к стажировке",
+        15: "стажировка запланирована/идёт",
+        16: "бот-стажировка завершена",
     }
 
     text = (
@@ -547,6 +565,8 @@ async def cmd_candidate(message: Message):
         reply_markup=kb_candidate_actions(
             cid, has_telegram, c.stage, c.status, has_test_1, has_test_2,
             test_numbers=[r.test_number for r in results],
+            position=getattr(c, "position", None),
+            internship_day=getattr(c, "internship_day", 0) or 0,
         ),
     )
 
@@ -1478,8 +1498,16 @@ async def show_candidate_card(callback: CallbackQuery):
         results = tr_result.scalars().all()
 
     stage_names = {
-        0: "не начал", 1: "видео 1 / тест 1", 2: "мотивация",
-        3: "видео 2 / тест 2", 4: "тесты пройдены", 5: "на кейсах", 6: "финал"
+        0: "не начал",
+        1: "видео 1 / тест 1", 2: "мотивация", 3: "видео 2 / тест 2",
+        4: "тесты пройдены", 5: "на кейсах", 6: "финал",
+        10: "анкета продажника",
+        11: "видео о компании",
+        12: "тест после видео",
+        13: "ждёт звонка РОП",
+        14: "после звонка / готов к стажировке",
+        15: "стажировка запланирована/идёт",
+        16: "бот-стажировка завершена",
     }
 
     text = (
@@ -1523,6 +1551,8 @@ async def show_candidate_card(callback: CallbackQuery):
             reply_markup=kb_candidate_actions(
                 cid, has_telegram, c.stage, c.status, has_test_1, has_test_2,
                 test_numbers=[r.test_number for r in results],
+                position=getattr(c, "position", None),
+                internship_day=getattr(c, "internship_day", 0) or 0,
             ),
         )
     except Exception:
@@ -1531,6 +1561,8 @@ async def show_candidate_card(callback: CallbackQuery):
             reply_markup=kb_candidate_actions(
                 cid, has_telegram, c.stage, c.status, has_test_1, has_test_2,
                 test_numbers=[r.test_number for r in results],
+                position=getattr(c, "position", None),
+                internship_day=getattr(c, "internship_day", 0) or 0,
             ),
         )
 
@@ -1576,6 +1608,111 @@ async def card_show_tests_menu(callback: CallbackQuery):
             f"Выберите тест, который нужно проверить:",
             reply_markup=kb_candidate_test_results(cid, results),
         )
+
+
+def _internship_date_options() -> list[tuple[str, str]]:
+    """Ближайшие 7 дат для выбора старта стажировки.
+
+    Значение в callback — YYYYMMDD, чтобы оно было коротким и безопасным для Telegram.
+    """
+    today = datetime.now(ZoneInfo("Europe/Minsk")).date()
+    labels = []
+    weekdays = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+    for i in range(7):
+        d = today + timedelta(days=i)
+        if i == 0:
+            prefix = "Сегодня"
+        elif i == 1:
+            prefix = "Завтра"
+        else:
+            prefix = weekdays[d.weekday()]
+        labels.append((f"{prefix}, {d.strftime('%d.%m.%Y')}", d.strftime("%Y%m%d")))
+    return labels
+
+
+@router.callback_query(F.data.startswith("ca_start_internship_"))
+async def card_start_internship_choose_date(callback: CallbackQuery):
+    """HR выбирает дату старта стажировки после звонка РОП."""
+    cid = int(callback.data[len("ca_start_internship_"):])
+
+    async with get_session() as s:
+        result = await s.execute(select(Candidate).where(Candidate.id == cid))
+        c = result.scalar_one_or_none()
+        tr_result = await s.execute(
+            select(TestResult).where(TestResult.candidate_id == cid).order_by(TestResult.test_number)
+        )
+        results = tr_result.scalars().all()
+
+    if not c:
+        await callback.answer("Кандидат не найден.", show_alert=True)
+        return
+
+    test_numbers = [r.test_number for r in results]
+    is_sales_flow = (
+        getattr(c, "position", None) == "sales"
+        or c.stage >= 10
+        or 10 in test_numbers
+        or any(num >= 100 for num in test_numbers)
+    )
+    if not is_sales_flow:
+        await callback.answer("Стажировка через этот сценарий доступна только для менеджера по продажам.", show_alert=True)
+        return
+    if not c.telegram_id:
+        await callback.answer("Кандидат ещё не активировал бот.", show_alert=True)
+        return
+
+    text = (
+        f"<b>🚀 Запуск стажировки</b>\n\n"
+        f"Кандидат: <b>{html.escape(c.full_name)}</b> (#{c.id})\n\n"
+        "Выберите дату, с которой бот начнёт отправлять стажировочные дни.\n"
+        "День 1 уйдёт в выбранную дату в <b>08:30</b>.\n"
+        "День 2 и День 3 уйдут в следующие календарные дни в <b>08:30</b>."
+    )
+
+    await callback.answer()
+    try:
+        await callback.message.edit_text(
+            text,
+            reply_markup=kb_internship_start_dates(cid, _internship_date_options()),
+        )
+    except Exception:
+        await callback.message.answer(
+            text,
+            reply_markup=kb_internship_start_dates(cid, _internship_date_options()),
+        )
+
+
+@router.callback_query(F.data.startswith("ca_set_internship_date_"))
+async def card_set_internship_date(callback: CallbackQuery, bot: Bot):
+    """HR подтвердил дату старта стажировки."""
+    payload = callback.data[len("ca_set_internship_date_"):]
+    try:
+        cid_str, date_value = payload.rsplit("_", 1)
+        cid = int(cid_str)
+        start_dt = datetime.strptime(date_value, "%Y%m%d").date()
+    except Exception:
+        await callback.answer("Не удалось распознать дату.", show_alert=True)
+        return
+
+    from handlers.sales import schedule_internship
+
+    ok, full_name, note = await schedule_internship(cid, start_dt, bot)
+    if not ok:
+        await callback.answer(note or "Не удалось запустить стажировку.", show_alert=True)
+        return
+
+    await callback.answer("Стажировка запланирована.")
+    text = (
+        f"✅ <b>Стажировка запланирована</b>\n\n"
+        f"Кандидат: <b>{html.escape(full_name)}</b> (#{cid})\n"
+        f"Дата старта: <b>{start_dt.strftime('%d.%m.%Y')}</b>\n"
+        f"Время отправки: <b>08:30</b>\n\n"
+        f"{html.escape(note or '')}"
+    )
+    try:
+        await callback.message.edit_text(text, reply_markup=kb_back_to_candidate(cid))
+    except Exception:
+        await callback.message.answer(text, reply_markup=kb_back_to_candidate(cid))
 
 
 @router.callback_query(F.data.startswith("ca_test_"))
@@ -2091,7 +2228,7 @@ async def cmd_invite_sales(message: Message, bot: Bot):
 
 @router.message(Command("start_internship"))
 async def cmd_start_internship(message: Message, bot: Bot):
-    """Запустить стажировку для продажника."""
+    """Запланировать стажировку для продажника на сегодня. Основной способ — кнопка в карточке."""
     parts = message.text.split()
     if len(parts) < 2:
         await message.answer("Использование: /start_internship ID")
@@ -2102,23 +2239,18 @@ async def cmd_start_internship(message: Message, bot: Bot):
         await message.answer("Неверный ID.")
         return
 
-    from handlers.sales import start_internship, send_internship_day
-    ok = await start_internship(cid, bot)
+    from handlers.sales import schedule_internship
+    start_dt = datetime.now(ZoneInfo("Europe/Minsk")).date()
+    ok, full_name, note = await schedule_internship(cid, start_dt, bot)
     if not ok:
-        await message.answer("Кандидат не найден или не является продажником.")
+        await message.answer(note or "Кандидат не найден или не является продажником.")
         return
 
-    # Сразу отправляем День 1
-    async with get_session() as s:
-        r = await s.execute(select(Candidate).where(Candidate.id == cid))
-        c = r.scalar_one()
-        full_name = c.full_name
-
-    await message.answer(f"🚀 Стажировка запущена для <b>{full_name}</b> (#{cid}). День 1 отправлен.")
-    async with get_session() as s:
-        r = await s.execute(select(Candidate).where(Candidate.id == cid))
-        c = r.scalar_one()
-    await send_internship_day(c, 1, bot)
+    await message.answer(
+        f"🚀 Стажировка запланирована для <b>{full_name}</b> (#{cid}).\n"
+        f"Дата старта: <b>{start_dt.strftime('%d.%m.%Y')}</b>.\n"
+        f"{html.escape(note or '')}"
+    )
 
 
 @router.message(Command("next_day"))

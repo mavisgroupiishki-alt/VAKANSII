@@ -2,7 +2,8 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date, time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from aiogram import Router, Bot, F
@@ -29,6 +30,9 @@ from data.materials import SALES_PRODUCTS_DOC_PATH
 
 log = logging.getLogger(__name__)
 router = Router()
+
+MINSK_TZ = ZoneInfo("Europe/Minsk")
+INTERNSHIP_SEND_TIME = time(8, 30)
 
 SALES_PASS  = 60   # порог теста по видео
 INTERN_PASS = 85   # запасной порог тестов стажировки
@@ -59,6 +63,18 @@ async def notify_hr(bot: Bot, text: str):
             log.error(f"HR notify error {hr_id}: {e}")
 
 
+async def notify_hr_with_card_button(bot: Bot, text: str, candidate_id: int):
+    """Уведомление HR с кнопкой перехода в карточку кандидата."""
+    markup = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="👤 Открыть карточку кандидата", callback_data=f"cd_{candidate_id}")
+    ]])
+    for hr_id in HR_TELEGRAM_IDS:
+        try:
+            await bot.send_message(hr_id, text, parse_mode="HTML", reply_markup=markup)
+        except Exception as e:
+            log.error(f"HR notify error {hr_id}: {e}")
+
+
 def get_sales_data(c: Candidate) -> dict:
     if c.sales_data:
         try:
@@ -66,6 +82,31 @@ def get_sales_data(c: Candidate) -> dict:
         except Exception:
             pass
     return {}
+
+
+def _dump_sales_data(data: dict) -> str:
+    return json.dumps(data, ensure_ascii=False)
+
+
+def _internship_meta(data: dict) -> dict:
+    meta = data.get("internship_schedule")
+    if not isinstance(meta, dict):
+        meta = {}
+        data["internship_schedule"] = meta
+    return meta
+
+
+def _parse_iso_date(value: str | None) -> date | None:
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except Exception:
+        return None
+
+
+def _format_date_ru(d: date) -> str:
+    return d.strftime("%d.%m.%Y")
 
 
 async def update_candidate(cid: int, **kwargs):
@@ -519,8 +560,8 @@ async def _finish_vtest(bot: Bot, cid: int, answers: list):
     if passed:
         await bot.send_message(tg_id, SALES_TEST_PASSED.format(score=score))
         anketa_text = "\n".join(f"• {k}: {v}" for k, v in anketa.items()) or "—"
-        await notify_hr(bot, HR_SALES_TEST_DONE.format(
-            name=full_name, cid=cid, score=score, anketa=anketa_text))
+        await notify_hr_with_card_button(bot, HR_SALES_TEST_DONE.format(
+            name=full_name, cid=cid, score=score, anketa=anketa_text), cid)
     else:
         await bot.send_message(tg_id, SALES_TEST_FAILED.format(score=score))
         await notify_hr(bot,
@@ -531,22 +572,86 @@ async def _finish_vtest(bot: Bot, cid: int, answers: list):
 # СТАЖИРОВКА
 # ══════════════════════════════════════════════════════════════
 
-async def start_internship(candidate_id: int, bot: Bot) -> bool:
+async def schedule_internship(candidate_id: int, start_date: date, bot: Bot) -> tuple[bool, str, str]:
+    """Планирует 3-дневную стажировку после звонка РОП.
+
+    День 1 будет отправлен в start_date в 08:30 по Минску.
+    День 2 и День 3 — в следующие календарные дни в 08:30.
+    Возвращает: ok, full_name, note.
+    """
+    today = datetime.now(MINSK_TZ).date()
+    if start_date < today:
+        return False, "", "Дата старта не может быть в прошлом."
+
     async with get_session() as s:
         r = await s.execute(select(Candidate).where(Candidate.id == candidate_id))
         c = r.scalar_one_or_none()
-        if not c or c.position != "sales":
-            return False
+        if not c:
+            return False, "", "Кандидат не найден."
+
+        tr_result = await s.execute(select(TestResult).where(TestResult.candidate_id == candidate_id))
+        test_numbers = [r.test_number for r in tr_result.scalars().all()]
+        is_sales_flow = (
+            getattr(c, "position", None) == "sales"
+            or c.stage >= 10
+            or 10 in test_numbers
+            or any(num >= 100 for num in test_numbers)
+        )
+        if not is_sales_flow:
+            return False, "", "Кандидат не является менеджером по продажам."
+        if not c.telegram_id:
+            return False, c.full_name if c else "", "Кандидат ещё не активировал бот."
+
+        # Для старых кандидатов, добавленных до выбора позиции, фиксируем позицию как sales.
+        if getattr(c, "position", None) != "sales":
+            c.position = "sales"
+
+        data = get_sales_data(c)
+        meta = _internship_meta(data)
+        meta["start_date"] = start_date.strftime("%Y-%m-%d")
+        meta["send_time"] = "08:30"
+        meta["timezone"] = "Europe/Minsk"
+        meta["sent_days"] = []
+        meta["scheduled_by_hr_at"] = datetime.now(MINSK_TZ).isoformat()
+
+        c.sales_data = _dump_sales_data(data)
         c.stage = 15
+        c.status = "active"
         c.internship_day = 0
-        c.internship_step = None
+        c.internship_step = "scheduled"
         c.awaiting = None
         c.last_activity_at = datetime.utcnow()
         tg_id = c.telegram_id
+        full_name = c.full_name
 
-    if tg_id:
-        await bot.send_message(tg_id, INTERNSHIP_WELCOME)
-    return True
+    try:
+        await bot.send_message(
+            tg_id,
+            INTERNSHIP_WELCOME +
+            f"\n\n📅 <b>Дата старта:</b> {_format_date_ru(start_date)}\n"
+            "⏰ Материалы будут приходить каждый день в <b>08:30</b>."
+        )
+    except Exception as e:
+        log.error(f"Не удалось уведомить кандидата о старте стажировки {candidate_id}: {e}")
+
+    note = "Кандидату отправлено сообщение о старте стажировки."
+
+    # Если HR выбрал сегодняшнюю дату уже после 08:30, не ждём следующий день — отправляем День 1 сразу.
+    now = datetime.now(MINSK_TZ)
+    if start_date == today and now.time() >= INTERNSHIP_SEND_TIME:
+        async with get_session() as s:
+            r = await s.execute(select(Candidate).where(Candidate.id == candidate_id))
+            c = r.scalar_one()
+        await send_internship_day(c, 1, bot)
+        note = "Так как сегодня уже позже 08:30, День 1 отправлен сразу."
+
+    return True, full_name, note
+
+
+async def start_internship(candidate_id: int, bot: Bot) -> bool:
+    """Совместимость со старой командой /start_internship: старт сегодня."""
+    ok, _, _ = await schedule_internship(candidate_id, datetime.now(MINSK_TZ).date(), bot)
+    return ok
 
 
 async def send_internship_day(candidate: Candidate, day: int, bot: Bot):
@@ -556,6 +661,17 @@ async def send_internship_day(candidate: Candidate, day: int, bot: Bot):
     async with get_session() as s:
         r = await s.execute(select(Candidate).where(Candidate.id == candidate.id))
         c = r.scalar_one()
+        data = get_sales_data(c)
+        meta = _internship_meta(data)
+        sent_days = meta.get("sent_days")
+        if not isinstance(sent_days, list):
+            sent_days = []
+        if day not in sent_days:
+            sent_days.append(day)
+        meta["sent_days"] = sorted(sent_days)
+        meta[f"day_{day}_sent_at"] = datetime.now(MINSK_TZ).isoformat()
+
+        c.sales_data = _dump_sales_data(data)
         c.internship_day = day
         c.internship_step = "materials"
         c.awaiting = dd["awaiting_task"]
@@ -919,34 +1035,57 @@ async def _handle_day_task(bot: Bot, candidate: Candidate, day: int, message: Me
 # НАПОМИНАНИЕ СТАЖЁРАМ (планировщик 9:00)
 # ══════════════════════════════════════════════════════════════
 
-async def remind_internship_next_day(bot: Bot):
+async def send_scheduled_internship_days(bot: Bot):
+    """Планировщик: каждый день в 08:30 по Минску отправляет нужный день стажировки.
+
+    Стажировка запускается HR через карточку кандидата. Дата старта хранится в sales_data,
+    поэтому новые колонки в БД не нужны.
+    """
+    now = datetime.now(MINSK_TZ)
+    today = now.date()
+
     async with get_session() as s:
         r = await s.execute(
             select(Candidate).where(
                 Candidate.position == "sales",
                 Candidate.stage == 15,
                 Candidate.status == "active",
-                Candidate.internship_step == "done",
             )
         )
         candidates = r.scalars().all()
 
     for c in candidates:
-        next_day = c.internship_day + 1
-        if 1 <= next_day <= 3:
-            dd = INTERNSHIP_DAYS[next_day]
-            if c.telegram_id:
-                try:
-                    await bot.send_message(
-                        c.telegram_id,
-                        INTERNSHIP_DAY_REMINDER.format(title=dd["title"]),
-                        reply_markup=kb_internship_start(next_day),
-                    )
-                except Exception as e:
-                    log.error(f"Reminder error {c.id}: {e}")
-        elif next_day > 3:
-            async with get_session() as s2:
-                r2 = await s2.execute(select(Candidate).where(Candidate.id == c.id))
-                cand = r2.scalar_one()
-                cand.stage = 16
-                cand.status = "passed"
+        data = get_sales_data(c)
+        meta = data.get("internship_schedule") if isinstance(data, dict) else None
+        if not isinstance(meta, dict):
+            continue
+
+        start_date = _parse_iso_date(meta.get("start_date"))
+        if not start_date or today < start_date:
+            continue
+
+        day = (today - start_date).days + 1
+        if day < 1 or day > 3:
+            continue
+
+        sent_days = meta.get("sent_days")
+        if not isinstance(sent_days, list):
+            sent_days = []
+        if day in sent_days:
+            continue
+
+        try:
+            await send_internship_day(c, day, bot)
+            await notify_hr(
+                bot,
+                f"📤 <b>Стажировочный день {day} отправлен автоматически</b>\n\n"
+                f"👤 {c.full_name} (#{c.id})\n"
+                f"⏰ {_format_date_ru(today)} 08:30"
+            )
+        except Exception as e:
+            log.error(f"Auto internship day send error for candidate {c.id}: {e}")
+
+
+async def remind_internship_next_day(bot: Bot):
+    """Старое имя оставлено для совместимости. Теперь отправка идёт по расписанию запуска."""
+    await send_scheduled_internship_days(bot)
