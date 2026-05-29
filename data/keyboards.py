@@ -115,6 +115,8 @@ def kb_candidate_actions(
     has_test_1: bool,
     has_test_2: bool,
     test_numbers: list[int] | None = None,
+    position: str | None = None,
+    internship_day: int = 0,
 ) -> InlineKeyboardMarkup:
     """Кнопки действий в карточке кандидата."""
     rows = []
@@ -138,6 +140,26 @@ def kb_candidate_actions(
         rows.append([
             InlineKeyboardButton(text="🧪 Посмотреть ответы на тесты", callback_data=f"ca_tests_{candidate_id}"),
         ])
+
+    # Запуск стажировки после звонка РОП.
+    # Показываем кнопку шире, чем только position == "sales", потому что старые кандидаты
+    # могли быть добавлены до появления поля "position" или с дефолтной позицией support.
+    # Кандидату кнопка не видна — это клавиатура только HR-карточки.
+    is_sales_flow = (
+        position == "sales"
+        or stage >= 10
+        or 10 in test_numbers
+        or any(num >= 100 for num in test_numbers)
+    )
+    if is_sales_flow and has_telegram and status not in ("rejected",):
+        if internship_day == 0:
+            button_text = "📅 Изменить дату старта стажировки" if stage == 15 else "🚀 Запустить стажировку"
+            rows.append([
+                InlineKeyboardButton(
+                    text=button_text,
+                    callback_data=f"ca_start_internship_{candidate_id}",
+                ),
+            ])
 
     # Кейсы — только если прошёл оба теста
     if has_test_1 and has_test_2 and status == "passed":
@@ -195,6 +217,21 @@ def kb_back_to_candidate(candidate_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="↩️ Назад в карточку", callback_data=f"cd_{candidate_id}")]
     ])
+
+
+def kb_internship_start_dates(candidate_id: int, dates: list[tuple[str, str]]) -> InlineKeyboardMarkup:
+    """Выбор даты старта стажировки для HR.
+
+    dates: список пар (label, yyyymmdd).
+    """
+    rows = []
+    for label, date_value in dates:
+        rows.append([InlineKeyboardButton(
+            text=label,
+            callback_data=f"ca_set_internship_date_{candidate_id}_{date_value}",
+        )])
+    rows.append([InlineKeyboardButton(text="↩️ Назад в карточку", callback_data=f"cd_{candidate_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def kb_status_choice(candidate_id: int) -> InlineKeyboardMarkup:
