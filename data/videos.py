@@ -2,7 +2,6 @@
 import os
 from pathlib import Path
 
-# Корень проекта = папка, где лежит этот файл + один уровень вверх
 _BASE = Path(__file__).parent.parent
 
 # Локальные файлы оставляем как запасной вариант, если ссылка не задана.
@@ -10,7 +9,6 @@ VIDEO_1_PATH = str(_BASE / "assets" / "MAVIS_GROUP.mp4")
 VIDEO_2_PATH = str(_BASE / "assets" / "MAVIS_PRODUCT.mp4")
 
 # Ссылки на видео. Их можно менять в Render → Environment без изменения кода.
-# Если переменная в Render не задана, для первого видео используется ссылка ниже.
 VIDEO_1_URL = os.getenv(
     "VIDEO_1_URL",
     "https://docs.google.com/videos/d/1i3c78SieIX4SOQVvViOQ1t5WSzKgY4UuCoqecyZ0fus/edit?usp=sharing",
@@ -18,6 +16,5 @@ VIDEO_1_URL = os.getenv(
 VIDEO_2_URL = os.getenv("VIDEO_2_URL", "").strip()
 
 # Для воронки менеджера по продажам можно задать отдельные ссылки.
-# Если отдельная ссылка не задана, используется общая ссылка VIDEO_1_URL / VIDEO_2_URL.
 SALES_VIDEO_1_URL = os.getenv("SALES_VIDEO_1_URL", VIDEO_1_URL).strip()
 SALES_VIDEO_2_URL = os.getenv("SALES_VIDEO_2_URL", VIDEO_2_URL).strip()
