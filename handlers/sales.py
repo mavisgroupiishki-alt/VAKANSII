@@ -25,12 +25,13 @@ from data.sales_flow import (
 )
 from data.videos import VIDEO_1_PATH, VIDEO_2_PATH, SALES_VIDEO_1_URL, SALES_VIDEO_2_URL
 from data.calls import GOOD_CALLS_URL, BAD_CALLS_URL
+from data.materials import SALES_PRODUCTS_DOC_PATH
 
 log = logging.getLogger(__name__)
 router = Router()
 
 SALES_PASS  = 60   # порог теста по видео
-INTERN_PASS = 70   # порог тестов стажировки
+INTERN_PASS = 85   # запасной порог тестов стажировки
 
 
 # ══════════════════════════════════════════════════════════════
@@ -122,6 +123,31 @@ async def send_video_safe(bot: Bot, tg_id: int, path: str, caption: str, reply_m
         await bot.send_message(tg_id, text)
 
 
+async def send_document_safe(bot: Bot, tg_id: int, path: str, caption: str = ""):
+    """Отправляет DOCX/PDF-файл кандидату, если файл есть в проекте."""
+    import os
+    search_paths = [
+        Path(path),
+        Path("/app") / path,
+        Path(os.getcwd()) / path,
+        Path(__file__).parent.parent / path,
+    ]
+    doc_path = next((p for p in search_paths if p.exists()), None)
+
+    if doc_path:
+        try:
+            await bot.send_document(tg_id, FSInputFile(doc_path), caption=caption)
+            return
+        except Exception as e:
+            log.error(f"Ошибка отправки документа {doc_path}: {e}")
+
+    log.warning(f"Документ не найден: {path}. Искал в: {[str(p) for p in search_paths]}")
+    await bot.send_message(
+        tg_id,
+        "⚠️ Учебный DOCX-файл временно недоступен. Напишите рекрутеру."
+    )
+
+
 # ══════════════════════════════════════════════════════════════
 # KEYBOARDS
 # ══════════════════════════════════════════════════════════════
@@ -151,6 +177,16 @@ def kb_consp_done():
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="✅ Конспект написан", callback_data="sales_consp_done")
     ]])
+
+
+def kb_calls_library():
+    """Кнопки на хорошие и плохие звонки для Дня 2."""
+    rows = []
+    if GOOD_CALLS_URL:
+        rows.append([InlineKeyboardButton(text="✅ Хорошие звонки", url=GOOD_CALLS_URL)])
+    if BAD_CALLS_URL:
+        rows.append([InlineKeyboardButton(text="❌ Плохие звонки", url=BAD_CALLS_URL)])
+    return InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
 
 def kb_internship_start(day: int):
     return InlineKeyboardMarkup(inline_keyboard=[[
@@ -527,6 +563,25 @@ async def send_internship_day(candidate: Candidate, day: int, bot: Bot):
         tg_id = c.telegram_id
 
     if tg_id:
+        # День 1: даем возможность посмотреть видео и почитать материал.
+        if day == 1:
+            await send_video_safe(
+                bot,
+                tg_id,
+                VIDEO_1_PATH,
+                "📹 Видео о MAVIS GROUP",
+                video_url=SALES_VIDEO_1_URL,
+            )
+
+        # День 2: бот отправляет DOCX-файл прямо в Telegram.
+        if day == 2:
+            await send_document_safe(
+                bot,
+                tg_id,
+                SALES_PRODUCTS_DOC_PATH,
+                caption="📄 Продуктовый материал Дня 2: СПК, аттестация, ISO/СУОТ, лицензии МВД и МЧС",
+            )
+
         materials_markup = kb_calls_library() if day == 2 else None
         await bot.send_message(tg_id, dd["materials"], reply_markup=materials_markup)
         await bot.send_message(tg_id, dd["task"])
@@ -549,23 +604,22 @@ async def cb_day_start(callback: CallbackQuery, bot: Bot):
 # ── Конспект (День 2) ─────────────────────────────────────────
 @router.callback_query(F.data == "sales_consp_done")
 async def cb_consp_done(callback: CallbackQuery, bot: Bot):
+    """Старый callback конспекта Дня 2 оставлен для совместимости."""
     await callback.answer()
     c = await get_sales_candidate(callback.from_user.id)
     if not c:
         return
-    await update_candidate(c.id, awaiting="internship_d2_test",
-                           internship_step="test")
     try:
         await callback.message.edit_reply_markup(reply_markup=None)
     except Exception:
         pass
-    dd = INTERNSHIP_DAYS[2]
-    await bot.send_message(c.telegram_id, "✅ Отлично! Конспект записан.\n\nТеперь пройди тест 👇")
-    await bot.send_message(c.telegram_id, dd["test_intro"],
-                           reply_markup=kb_start_test("itest_start_2"))
+    await bot.send_message(
+        c.telegram_id,
+        "Этот шаг больше не используется. В новой версии Дня 2 нужно отправить один развёрнутый текстовый ответ по продуктам и звонкам."
+    )
 
 
-# ── Тесты стажировки (Дни 1, 2, 3) ───────────────────────────
+# ── Тесты стажировки (автоматический тест сейчас есть только в Дне 1) ──
 @router.callback_query(F.data.startswith("itest_start_"))
 async def cb_itest_start(callback: CallbackQuery, bot: Bot):
     await callback.answer()
@@ -802,12 +856,11 @@ async def handle_sales_text(message: Message, bot: Bot) -> bool:
         await message.answer(dd["consp_task"], reply_markup=kb_consp_done())
         return True
 
-    # Текстовые задания дней 1, 3, 4, 5
+    # Текстовые задания стажировки в боте: дни 1, 2, 3
     day_map = {
         "internship_d1_task": 1,
+        "internship_d2_task": 2,
         "internship_d3_task": 3,
-        "internship_d4_task": 4,
-        "internship_d5_task": 5,
     }
     if awaiting in day_map:
         day = day_map[awaiting]
@@ -850,12 +903,16 @@ async def _handle_day_task(bot: Bot, candidate: Candidate, day: int, message: Me
     if dd.get("has_test"):
         await message.answer(dd["test_intro"],
                              reply_markup=kb_start_test(f"itest_start_{day}"))
-    elif day == 5:
+
+    if dd.get("final_day"):
         async with get_session() as s:
             r = await s.execute(select(Candidate).where(Candidate.id == cid))
             c = r.scalar_one()
             c.stage = 16
             c.status = "passed"
+            c.internship_step = "finished_bot"
+            c.awaiting = None
+            c.last_activity_at = datetime.utcnow()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -876,7 +933,7 @@ async def remind_internship_next_day(bot: Bot):
 
     for c in candidates:
         next_day = c.internship_day + 1
-        if 1 <= next_day <= 5:
+        if 1 <= next_day <= 3:
             dd = INTERNSHIP_DAYS[next_day]
             if c.telegram_id:
                 try:
@@ -887,7 +944,7 @@ async def remind_internship_next_day(bot: Bot):
                     )
                 except Exception as e:
                     log.error(f"Reminder error {c.id}: {e}")
-        elif next_day > 5:
+        elif next_day > 3:
             async with get_session() as s2:
                 r2 = await s2.execute(select(Candidate).where(Candidate.id == c.id))
                 cand = r2.scalar_one()

@@ -2143,8 +2143,8 @@ async def cmd_next_day(message: Message, bot: Bot):
         next_day = c.internship_day + 1
         full_name = c.full_name
 
-    if next_day > 5:
-        await message.answer(f"<b>{full_name}</b> уже прошёл все 5 дней стажировки.")
+    if next_day > 3:
+        await message.answer(f"<b>{full_name}</b> уже прошёл 3 стажировочных дня в боте. Дальше план работ даёт РОП.")
         return
 
     from handlers.sales import send_internship_day
