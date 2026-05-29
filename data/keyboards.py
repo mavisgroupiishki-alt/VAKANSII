@@ -118,6 +118,7 @@ def kb_candidate_actions(
 ) -> InlineKeyboardMarkup:
     """Кнопки действий в карточке кандидата."""
     rows = []
+    test_numbers = test_numbers or []
 
     # Связь — только если кандидат активировал приглашение
     if has_telegram:
@@ -131,21 +132,18 @@ def kb_candidate_actions(
             InlineKeyboardButton(text="🔗 Показать ссылку-приглашение", callback_data=f"ca_invite_{candidate_id}"),
         ])
 
+    # Отдельная кнопка для рекрутера: просмотр ответов по тестам.
+    # Кандидат её не видит, потому что она показывается только в HR-карточке.
+    if test_numbers:
+        rows.append([
+            InlineKeyboardButton(text="🧪 Посмотреть ответы на тесты", callback_data=f"ca_tests_{candidate_id}"),
+        ])
+
     # Кейсы — только если прошёл оба теста
     if has_test_1 and has_test_2 and status == "passed":
         rows.append([
             InlineKeyboardButton(text="📋 Получить кейсы", callback_data=f"ca_cases_{candidate_id}"),
         ])
-
-    # Детализация тестов: какие вопросы были верные/неверные
-    if test_numbers:
-        for test_num in test_numbers:
-            rows.append([
-                InlineKeyboardButton(
-                    text=f"🔎 Ошибки по тесту {test_num}",
-                    callback_data=f"td_{candidate_id}_{test_num}",
-                )
-            ])
 
     # Изменение статуса
     rows.append([
@@ -174,6 +172,29 @@ def kb_candidate_actions(
     ])
 
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_candidate_test_results(candidate_id: int, results: list) -> InlineKeyboardMarkup:
+    """Список тестов кандидата для просмотра подробных ответов."""
+    rows = []
+    for r in results:
+        mark = "✅" if r.passed else "❌"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{mark} Тест {r.test_number} — {r.score_percent}%",
+                callback_data=f"ca_test_{candidate_id}_{r.test_number}",
+            )
+        ])
+
+    rows.append([InlineKeyboardButton(text="↩️ Назад в карточку", callback_data=f"cd_{candidate_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def kb_back_to_candidate(candidate_id: int) -> InlineKeyboardMarkup:
+    """Кнопка возврата в карточку кандидата."""
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="↩️ Назад в карточку", callback_data=f"cd_{candidate_id}")]
+    ])
 
 
 def kb_status_choice(candidate_id: int) -> InlineKeyboardMarkup:
