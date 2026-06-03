@@ -138,9 +138,60 @@ async def notify_hr(bot: Bot, text: str) -> None:
     """Отправить уведомление всем рекрутерам."""
     for hr_id in HR_TELEGRAM_IDS:
         try:
-            await bot.send_message(hr_id, text)
+            await bot.send_message(hr_id, text, parse_mode="HTML")
         except Exception as e:
             print(f"Не удалось уведомить HR {hr_id}: {e}")
+
+
+async def _candidate_sales_data(candidate: Candidate) -> dict:
+    """Безопасно читает sales_data кандидата."""
+    raw = getattr(candidate, "sales_data", None)
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _direct_internship_start_day(candidate: Candidate) -> int | None:
+    """Возвращает день, если кандидат добавлен сразу на стажировку."""
+    data = {}
+    raw = getattr(candidate, "sales_data", None)
+    if raw:
+        try:
+            data = json.loads(raw)
+        except Exception:
+            data = {}
+
+    if not data.get("direct_internship"):
+        return None
+
+    try:
+        day = int(data.get("direct_internship_day", 1))
+    except Exception:
+        day = 1
+
+    return day if day in (1, 2, 3) else 1
+
+
+def _direct_internship_day_already_sent(candidate: Candidate, day: int) -> bool:
+    """Проверяет, был ли выбранный день уже отправлен кандидату."""
+    raw = getattr(candidate, "sales_data", None)
+    if not raw:
+        return False
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return False
+
+    meta = data.get("internship_schedule")
+    if not isinstance(meta, dict):
+        return False
+
+    sent_days = meta.get("sent_days")
+    return isinstance(sent_days, list) and day in sent_days
 
 
 # ============================================================
@@ -204,6 +255,29 @@ async def cmd_start(message: Message, bot: Bot):
             "👋 Здравствуйте! Этот бот доступен только для приглашённых кандидатов.\n\n"
             "Если вы ожидаете собеседования в Mavis Group — свяжитесь с рекрутером, "
             "чтобы получить ссылку-приглашение."
+        )
+        return
+
+    direct_day = _direct_internship_start_day(candidate)
+    if direct_day is not None:
+        # Кандидат был добавлен рекрутером сразу на стажировку.
+        # Пропускаем анкету, видео и стартовый тест.
+        if _direct_internship_day_already_sent(candidate, direct_day):
+            await message.answer(
+                "Вы уже активировали ссылку и получили стажировочный материал. "
+                "Продолжайте выполнять задание в боте. Если что-то не открывается — напишите рекрутеру."
+            )
+            return
+
+        await message.answer(
+            f"👋 <b>Здравствуйте, {candidate.full_name.split()[0]}!</b>\n\n"
+            f"Рекрутер добавил вас сразу на стажировку. Сейчас бот отправит вам <b>День {direct_day}</b>."
+        )
+        from handlers.sales import send_internship_day
+        await send_internship_day(candidate, direct_day, bot)
+        await notify_hr(
+            bot,
+            f"🚀 Кандидат <b>{candidate.full_name}</b> (#{candidate.id}) активировал ссылку и получил День {direct_day} стажировки."
         )
         return
 
@@ -603,18 +677,35 @@ async def finish_test(message: Message, candidate_id: int, test_num: int):
         # Спрашиваем мотивационный вопрос
         await message.answer(MOTIVATION_QUESTION)
     elif passed and test_num == 2:
-        # Финал тестовой части — предлагаем выбрать время собеседования
+        # Финал тестовой части экспертной воронки.
+        # Время собеседования больше не выбирается в боте: РОП/рекрутер связываются вручную.
         await message.answer(
-            INTERVIEW_PASSED,
-            reply_markup=kb_interview_slots(),
+            "🎉 <b>Поздравляем, вы прошли тесты!</b>\n\n"
+            "Следующий этап — итоговое собеседование.\n\n"
+            "Для согласования итогового собеседования с вами свяжется "
+            "руководитель отдела продаж или рекрутер.\n\n"
+            "Пожалуйста, будьте на связи 📞"
         )
-        await notify_hr(bot, HR_INTERVIEW_PASSED.format(
-            name=full_name, candidate_id=candidate_id
-        ))
-        # Обновляем awaiting, чтобы напоминания при необходимости работали
+
+        # Уведомляем рекрутера, что кандидат готов к ручному назначению итогового собеседования.
+        await notify_hr(
+            bot,
+            "🎉 <b>{name}</b> успешно прошёл оба теста!\n\n"
+            "Кандидат ждёт звонка/сообщения для итогового собеседования.\n"
+            "Время в боте больше не выбирается.\n\n"
+            "ID кандидата: <b>{candidate_id}</b>\n"
+            "Получить список кейсов — /cases {candidate_id}".format(
+                name=full_name,
+                candidate_id=candidate_id,
+            ),
+        )
+
+        # На всякий случай фиксируем, что кандидат ничего больше не должен выбирать в боте.
         async with get_session() as s:
             cand = (await s.execute(select(Candidate).where(Candidate.id == candidate_id))).scalar_one()
-            cand.awaiting = "slot_pick"
+            cand.awaiting = None
+            cand.interview_slot = None
+            cand.last_activity_at = datetime.utcnow()
 
 
 async def send_review(message: Message, questions: list[dict], errors: list[tuple]):
